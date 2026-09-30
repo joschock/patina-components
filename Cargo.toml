@@ -20,8 +20,10 @@ patina = { git = "https://github.com/joschock/patina", branch = "usb_hid_protoco
 r-efi = { version = "7", default-features = false }
 scroll = { version = "0.13", default-features = false, features = ["derive"] }
 
-[patch.crates-io]
-r-efi = { git = "https://github.com/joschock/r-efi.git", branch = "add_usb_io" }
+# Local patina tree override for development. Build is expected to fail until
+# integration code is updated to match the local tree.
+[patch."https://github.com/joschock/patina"]
+patina = { path = "/home/schock/patina/sdk/patina" }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
