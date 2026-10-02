@@ -9,11 +9,15 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use r_efi::{efi, efi::protocols::usb_io};
+use r_efi::efi::protocols::usb_io;
 
-use patina::vendor_protocols::hid_io::{HidIoProtocol, HidIoReportCallback};
-
-use crate::interrupt_transfers::TransferRecoveryTimer;
+use patina::{
+    component::service::{
+        Service,
+        uefi_services::{event::Event, timer_event::TimerEventServices},
+    },
+    vendor_protocols::hid_io::{HidIoProtocol, HidIoReportCallback},
+};
 
 /// USB HID descriptor set read from the device during initialization.
 #[derive(Debug)]
@@ -32,8 +36,8 @@ pub struct ReportCallbackState {
 
 /// Per-device context for a USB HID device managed by this driver.
 ///
-/// Allocated on the heap during `driver_binding_start` and freed during
-/// `driver_binding_stop`. The `hid_io` field is installed as a protocol
+/// Allocated on the heap during driver binding `start` and freed during
+/// driver binding `stop`. The `hid_io` field is installed as a protocol
 /// interface on the controller handle.
 #[repr(C)]
 pub struct UsbHidDevice {
@@ -43,11 +47,11 @@ pub struct UsbHidDevice {
     pub usb_io: *mut usb_io::Protocol,
     pub descriptors: UsbHidDescriptors,
     pub report_callback: ReportCallbackState,
-    /// Boot services timer interface for delayed error recovery.
-    pub(crate) timer_services: &'static dyn TransferRecoveryTimer,
+    /// Timer event services used to arm the delayed error recovery timer.
+    pub(crate) timer_services: Service<dyn TimerEventServices>,
     /// Timer event armed by the interrupt callback on transfer errors. The event's
     /// notify function re-submits the async interrupt transfer after a delay.
-    pub(crate) recovery_event: efi::Event,
+    pub(crate) recovery_event: Option<Event>,
 }
 
 impl UsbHidDevice {
@@ -67,17 +71,11 @@ impl UsbHidDevice {
 mod test {
     use super::*;
     use crate::hid_io_impl;
+    use alloc::boxed::Box;
+    use patina::component::service::uefi_services::timer_event::MockTimerEventServices;
 
     #[test]
     fn from_hid_io_protocol_recovers_device() {
-        struct NoopTimer;
-        impl crate::interrupt_transfers::TransferRecoveryTimer for NoopTimer {
-            fn arm_recovery_timer(&self, _: efi::Event, _: u64) -> Result<(), efi::Status> {
-                Ok(())
-            }
-        }
-        static NOOP: NoopTimer = NoopTimer;
-
         let device = Box::new(UsbHidDevice {
             hid_io: hid_io_impl::new_hid_io_protocol(),
             usb_io: core::ptr::null_mut(),
@@ -87,8 +85,8 @@ mod test {
                 report_descriptor: Vec::new(),
             },
             report_callback: ReportCallbackState::default(),
-            timer_services: &NOOP,
-            recovery_event: core::ptr::null_mut(),
+            timer_services: Service::mock(Box::new(MockTimerEventServices::new())),
+            recovery_event: None,
         });
 
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;

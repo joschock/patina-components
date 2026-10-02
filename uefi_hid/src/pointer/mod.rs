@@ -16,6 +16,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
+use core::ptr::NonNull;
 
 use r_efi::{efi, protocols};
 
@@ -25,11 +26,17 @@ use hidparser::{
 };
 
 use patina::{
-    boot_services::{BootServices, c_ptr::PtrMetadata, tpl::Tpl},
-    tpl_mutex::TplMutex,
+    component::service::{
+        Service,
+        uefi_services::{handle::Handle, tpl::TplServices},
+    },
+    uefi::{boot_services::tpl::Tpl, tpl_mutex::TplMutex},
 };
 
-use crate::hid_io::{HidIo, HidReportReceiver};
+use crate::{
+    HidServices,
+    hid_io::{HidIo, HidReportReceiver},
+};
 
 use self::absolute_pointer::AbsolutePointerFfi;
 
@@ -294,72 +301,84 @@ impl PointerProcessor {
 }
 
 /// Pointer HID handler that processes reports and produces UEFI AbsolutePointer state.
-pub struct PointerHidHandler<T: BootServices + Clone + 'static> {
-    boot_services: &'static T,
-    controller: efi::Handle,
-    absolute_pointer_key: Option<PtrMetadata<'static, Box<AbsolutePointerFfi<T>>>>,
+///
+/// Protocol entry points and report delivery use shared references derived from the receiver's root pointer.
+/// The processor is immutable after construction; mutable input state is protected at TPL_NOTIFY.
+pub struct PointerHidHandler {
     pub(crate) processor: PointerProcessor,
-    pub(crate) state: TplMutex<PointerState, T>,
+    pub(crate) state: TplMutex<PointerState, Service<dyn TplServices>>,
 }
 
-impl<T: BootServices + Clone + 'static> PointerHidHandler<T> {
-    /// Creates a fully initialized Pointer HID handler for the given controller.
-    ///
-    /// Returns a boxed handler because protocol installation stores raw pointers to `self`.
-    /// Boxing first ensures those pointers remain valid (the handler is never moved after boxing).
-    pub fn new(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        hid_io: &dyn HidIo,
-    ) -> Result<Box<Self>, efi::Status> {
-        let mut processor = PointerProcessor::new();
-        let descriptor = hid_io.get_report_descriptor()?;
-        processor.process_descriptor(descriptor)?;
-
-        let mut handler = Box::new(Self {
-            boot_services,
-            controller,
-            absolute_pointer_key: None,
-            processor,
-            state: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, PointerState::new()),
-        });
-
-        let key = AbsolutePointerFfi::install(boot_services, controller, &mut *handler)?;
-        handler.absolute_pointer_key = Some(key);
-        Ok(handler)
-    }
-
-    #[cfg(test)]
-    pub fn new_for_test(boot_services: &'static T) -> Self {
-        Self {
-            boot_services,
-            controller: core::ptr::null_mut(),
-            absolute_pointer_key: None,
-            processor: PointerProcessor::new(),
-            state: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, PointerState::new()),
-        }
-    }
-}
-
-impl<T: BootServices + Clone + 'static> HidReportReceiver for PointerHidHandler<T> {
-    fn receive_report(&mut self, report: &[u8], _hid_io: &dyn HidIo) {
+impl PointerHidHandler {
+    fn receive_report(&self, report: &[u8]) {
         log::trace!("pointer::receive_report: {:?} bytes", report.len());
         self.processor.process_report(report, &mut self.state.lock());
     }
 }
 
-impl<T: BootServices + Clone + 'static> Drop for PointerHidHandler<T> {
+/// Owns the pointer handler allocation and its installed protocol context.
+///
+/// Keeping ownership separate from the handler lets report delivery borrow this receiver mutably without
+/// exclusively borrowing the handler referenced by protocol entry points.
+pub struct PointerReceiver {
+    services: HidServices,
+    controller: Handle,
+    absolute_pointer: Option<*mut AbsolutePointerFfi>,
+    root: NonNull<PointerHidHandler>,
+}
+
+impl PointerReceiver {
+    /// Creates a fully initialized Pointer HID handler for the given controller.
+    pub fn new(services: HidServices, controller: Handle, hid_io: &dyn HidIo) -> Result<Self, efi::Status> {
+        let mut processor = PointerProcessor::new();
+        let descriptor = hid_io.get_report_descriptor()?;
+        processor.process_descriptor(descriptor)?;
+
+        let root = NonNull::new(Box::into_raw(Box::new(PointerHidHandler {
+            processor,
+            state: TplMutex::new(services.tpl, Tpl::NOTIFY, PointerState::new()),
+        })))
+        .expect("Box pointers are non-null");
+
+        let mut receiver = Self { services, controller, absolute_pointer: None, root };
+        let mode = AbsolutePointerFfi::initialize_mode(receiver.handler());
+        receiver.absolute_pointer =
+            Some(AbsolutePointerFfi::install(services, controller, root.as_ptr().cast_const(), mode)?);
+        Ok(receiver)
+    }
+
+    fn handler(&self) -> &PointerHidHandler {
+        // SAFETY: root is initialized in new and freed only after the protocol context has been released.
+        // All accesses to the handler derive shared references from this root.
+        unsafe { self.root.as_ref() }
+    }
+}
+
+impl HidReportReceiver for PointerReceiver {
+    fn receive_report(&mut self, report: &[u8], _hid_io: &dyn HidIo) {
+        self.handler().receive_report(report);
+    }
+}
+
+impl Drop for PointerReceiver {
     fn drop(&mut self) {
-        if let Some(key) = self.absolute_pointer_key.take()
-            && let Err(status) = AbsolutePointerFfi::<T>::uninstall(self.boot_services, self.controller, key)
+        if let Some(context) = self.absolute_pointer.take()
+            && let Err(status) = AbsolutePointerFfi::uninstall(self.services, self.controller, context)
         {
-            log::error!("PointerHidHandler::drop: Failed to uninstall absolute_pointer: {:?}", status);
+            log::error!(
+                "PointerReceiver::drop: leaking pointer handler; failed to release absolute_pointer: {:?}",
+                status
+            );
+            return;
         }
+        // SAFETY: root came from Box::into_raw and all installed contexts referencing it have been released.
+        drop(unsafe { Box::from_raw(self.root.as_ptr()) });
     }
 }
 
 #[cfg(test)]
 mod test {
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use hidparser::{
         ReportDescriptor, ReportField, VariableField,
         report_data_types::{ReportAttributes, Usage},
@@ -367,6 +386,15 @@ mod test {
     use r_efi::efi;
 
     use super::*;
+
+    impl PointerHidHandler {
+        pub(super) fn new_for_test(services: HidServices) -> Self {
+            Self {
+                processor: PointerProcessor::new(),
+                state: TplMutex::new(services.tpl, Tpl::NOTIFY, PointerState::new()),
+            }
+        }
+    }
 
     // Creates an absolute VariableField at the given bit range with the given usage.
     fn absolute_field(usage: u32, bits: core::ops::Range<u32>, logical_max: i32) -> VariableField {
@@ -401,6 +429,80 @@ mod test {
             bad_output_reports: alloc::vec![],
             features: alloc::vec![],
             bad_features: alloc::vec![],
+        }
+    }
+
+    fn receiver_for_test(services: HidServices) -> PointerReceiver {
+        let mut hid_io = crate::hid_io::MockHidIo::new();
+        hid_io.expect_get_report_descriptor().returning(|| {
+            Ok(descriptor_with_fields(
+                alloc::vec![ReportField::Variable(absolute_field(GENERIC_DESKTOP_X, 0..8, 255))],
+                8,
+            ))
+        });
+        PointerReceiver::new(services, crate::test_stubs::test_handle(0x2), &hid_io).unwrap()
+    }
+
+    #[test]
+    fn receiver_delivers_reports_and_releases_protocol() {
+        let closed = alloc::sync::Arc::new(AtomicUsize::new(0));
+        let closed_for_mock = closed.clone();
+        let services = crate::test_stubs::mock_services(|protocols, events, timers| {
+            protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+            events.expect_close_event().returning(move |_| {
+                closed_for_mock.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
+        let mut receiver = receiver_for_test(services);
+        receiver.receive_report(&[128], &crate::hid_io::MockHidIo::new());
+        assert!(receiver.handler().state.lock().state_changed);
+        drop(receiver);
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn receiver_retains_handler_on_protocol_uninstall_failure() {
+        let services = crate::test_stubs::mock_services(|protocols, _, timers| {
+            protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
+            protocols.expect_uninstall_interface().returning(|_, _, _| {
+                Err(patina::component::service::uefi_services::protocol::ProtocolError::AccessDenied)
+            });
+            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+        });
+        let receiver = receiver_for_test(services);
+        let root = receiver.root;
+        let context = receiver.absolute_pointer.unwrap();
+        drop(receiver);
+        // SAFETY: failed uninstall retains both allocations. No actual firmware owns them in this mock.
+        unsafe {
+            assert!(!root.as_ref().state.lock().state_changed);
+            drop(Box::from_raw(context));
+            drop(Box::from_raw(root.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn receiver_retains_handler_on_event_close_failure() {
+        let services = crate::test_stubs::mock_services(|protocols, events, timers| {
+            protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+            events
+                .expect_close_event()
+                .returning(|_| Err(patina::component::service::uefi_services::event::EventError::InvalidParameter));
+        });
+        let receiver = receiver_for_test(services);
+        let root = receiver.root;
+        let context = receiver.absolute_pointer.unwrap();
+        drop(receiver);
+        // SAFETY: failed event close retains both allocations. No actual firmware owns them in this mock.
+        unsafe {
+            assert!(!root.as_ref().state.lock().state_changed);
+            drop(Box::from_raw(context));
+            drop(Box::from_raw(root.as_ptr()));
         }
     }
 

@@ -15,7 +15,7 @@ use r_efi::{efi, efi::protocols::usb_io};
 /// Creates a stub USB IO protocol with panicking function pointers.
 ///
 /// Callers should replace the function pointers they need before use.
-#[coverage(off)]
+#[cfg_attr(coverage, coverage(off))]
 pub fn usb_io_stub() -> usb_io::Protocol {
     unsafe extern "efiapi" fn stub_control_transfer(
         _this: *mut usb_io::Protocol,

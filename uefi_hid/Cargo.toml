@@ -19,7 +19,7 @@ ctrl-alt-del = []
 hidparser = { workspace = true }
 log = { workspace = true }
 num_enum = { workspace = true }
-patina = { workspace = true }
+patina = { workspace = true, features = ["alloc"] }
 r-efi = { workspace = true }
 scroll = { workspace = true }
 

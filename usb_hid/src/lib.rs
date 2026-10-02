@@ -10,7 +10,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 #![cfg_attr(not(test), no_std)]
-#![feature(coverage_attribute)]
+#![cfg_attr(coverage, feature(coverage_attribute))]
 
 extern crate alloc;
 
@@ -25,27 +25,20 @@ pub(crate) mod usb_hid_defs;
 #[cfg(test)]
 pub(crate) mod test_stubs;
 
-use alloc::boxed::Box;
-
-use r_efi::efi;
-
 use patina::{
-    BinaryGuid,
-    boot_services::{BootServices, StandardBootServices},
-    component::{component, params},
-    driver_binding::UefiDriverBinding,
+    component::{
+        component,
+        service::{
+            Service,
+            uefi_services::{
+                event::EventServices,
+                protocol::{ProtocolServices, ProtocolServicesExt},
+                timer_event::TimerEventServices,
+            },
+        },
+    },
     error::Result,
-    uefi_protocol::ProtocolInterface,
 };
-
-/// Zero-sized marker protocol used to create a dedicated driver binding handle.
-#[repr(C)]
-struct UsbHidMarker;
-
-// SAFETY: UsbHidMarker is a ZST whose GUID uniquely identifies this component.
-unsafe impl ProtocolInterface for UsbHidMarker {
-    const PROTOCOL_GUID: BinaryGuid = BinaryGuid::from_string("a7f36d52-8e3b-4f1a-9c5d-7b2e4a6f8d01");
-}
 
 /// USB HID Patina component.
 ///
@@ -55,75 +48,78 @@ pub struct UsbHidComponent;
 
 #[component]
 impl UsbHidComponent {
-    fn entry_point(self, boot_services: StandardBootServices, image_handle: params::Handle) -> Result<()> {
-        let boot_services: &'static StandardBootServices = Box::leak(Box::new(boot_services));
-        install_usb_hid_driver_binding(boot_services, *image_handle)
+    fn entry_point(
+        self,
+        protocols: Service<dyn ProtocolServices>,
+        events: Service<dyn EventServices>,
+        timers: Service<dyn TimerEventServices>,
+    ) -> Result<()> {
+        install_usb_hid_driver_binding(protocols, events, timers)
     }
 }
 
-/// Installs the USB HID driver binding using the provided boot services.
-fn install_usb_hid_driver_binding<T: BootServices + Clone + 'static>(
-    boot_services: &'static T,
-    image_handle: efi::Handle,
+/// Installs the USB HID driver binding.
+///
+/// Separated from the component entry point to allow testing with mock services.
+fn install_usb_hid_driver_binding(
+    protocols: Service<dyn ProtocolServices>,
+    events: Service<dyn EventServices>,
+    timers: Service<dyn TimerEventServices>,
 ) -> Result<()> {
-    let (driver_binding_handle, _marker_key) =
-        boot_services.install_protocol_interface(None, Box::new(UsbHidMarker))?;
-
-    let driver = driver::UsbHidDriver::new(driver_binding_handle);
-
-    let mut driver_binding =
-        UefiDriverBinding::new_with_driver_handle(driver, image_handle, driver_binding_handle, boot_services);
-
-    driver_binding.install().map_err(patina::error::EfiError::from)?;
-
+    protocols.install_driver_binding(driver::UsbHidDriver::new(protocols, events, timers))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
-    use patina::boot_services::{MockBootServices, c_ptr::CPtr};
-
     use super::*;
+    use patina::{
+        component::service::uefi_services::{
+            event::MockEventServices,
+            handle::Handle,
+            protocol::{MockProtocolServices, ProtocolError},
+            timer_event::MockTimerEventServices,
+        },
+        error::EfiError,
+    };
+    use r_efi::efi;
 
-    #[test]
-    fn install_usb_hid_binding_should_install_a_binding() {
-        let boot_services = Box::leak(Box::new(MockBootServices::new()));
-
-        boot_services.expect_install_protocol_interface::<UsbHidMarker, Box<UsbHidMarker>>().returning(
-            |handle, protocol_interface| {
-                assert_eq!(handle, None, "Expected no handle for marker protocol installation");
-                Ok((0x5678 as efi::Handle, protocol_interface.metadata()))
-            },
-        );
-
-        boot_services.expect_install_protocol_interface_unchecked().returning(|handle, protocol, interface| {
-            if protocol == &efi::protocols::driver_binding::PROTOCOL_GUID {
-                assert!(
-                    handle.is_some_and(|handle| handle as usize == 0x5678),
-                    "Expected correct handle for driver binding protocol"
-                );
-                assert!(!interface.is_null(), "Expected non-null interface for driver binding protocol");
-                return Ok(0x9abc as efi::Handle);
-            }
-            panic!("Unexpected protocol installation: {:?}", protocol);
-        });
-
-        let mock_image_handle = 0x1234 as efi::Handle;
-        install_usb_hid_driver_binding(boot_services, mock_image_handle).expect("install should succeed");
+    fn event_and_timer_mocks() -> (Service<dyn EventServices>, Service<dyn TimerEventServices>) {
+        (Service::mock(Box::new(MockEventServices::new())), Service::mock(Box::new(MockTimerEventServices::new())))
     }
 
     #[test]
-    fn install_usb_hid_binding_handles_marker_failure() {
-        let boot_services = Box::leak(Box::new(MockBootServices::new()));
+    fn install_usb_hid_binding_should_install_a_binding() {
+        let mut protocols = MockProtocolServices::new();
+        protocols.expect_register_agent().times(1).returning(|| Ok(Handle::from_raw(0x5678 as efi::Handle).unwrap()));
+        protocols
+            .expect_install_interface()
+            .withf(|handle, guid, _| {
+                *handle == Handle::from_raw(0x5678 as efi::Handle)
+                    && *guid == efi::protocols::driver_binding::PROTOCOL_GUID
+            })
+            .times(1)
+            .returning(|handle, _, _| Ok(handle.unwrap()));
+        let (events, timers) = event_and_timer_mocks();
 
-        boot_services
-            .expect_install_protocol_interface::<UsbHidMarker, Box<UsbHidMarker>>()
-            .returning(|_, _| Err(efi::Status::OUT_OF_RESOURCES));
+        install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers)
+            .expect("install should succeed");
+    }
 
-        let mock_image_handle = 0x1234 as efi::Handle;
+    #[test]
+    fn install_usb_hid_binding_handles_failure() {
+        let mut protocols = MockProtocolServices::new();
+        protocols.expect_register_agent().returning(|| Err(ProtocolError::Internal));
+        let (events, timers) = event_and_timer_mocks();
+        assert!(install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers).is_err());
+
+        let mut protocols = MockProtocolServices::new();
+        protocols.expect_register_agent().returning(|| Ok(Handle::from_raw(0x5678 as efi::Handle).unwrap()));
+        protocols.expect_install_interface().returning(|_, _, _| Err(ProtocolError::OutOfResources));
+        let (events, timers) = event_and_timer_mocks();
         assert_eq!(
-            install_usb_hid_driver_binding(boot_services, mock_image_handle),
-            Err(efi::Status::OUT_OF_RESOURCES.into())
+            install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers),
+            Err(EfiError::OutOfResources)
         );
     }
 }

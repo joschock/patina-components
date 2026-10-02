@@ -6,72 +6,32 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-use core::ffi::c_void;
+use core::{ffi::c_void, time::Duration};
 
 use r_efi::{efi, efi::protocols::usb_io};
 
-use patina::boot_services::{
-    BootServices,
-    event::{EventTimerType, EventType},
-    tpl::Tpl,
-};
+use patina::component::service::uefi_services::timer_event::TimerType;
 
 use crate::{control_transfers, device::UsbHidDevice};
 
-/// Delay in 100ns units before re-submitting after a transfer error.
+/// Delay before re-submitting after a transfer error.
 /// 100ms matches the standard EDKII `EFI_USB_INTERRUPT_DELAY`.
-const RECOVERY_DELAY_100NS: u64 = 1_000_000;
+const RECOVERY_DELAY: Duration = Duration::from_millis(100);
 
-/// Object-safe subset of [`BootServices`] for timer operations.
+/// Recovery timer notify handler that re-submits the async interrupt transfer
+/// after a transfer error.
 ///
-/// The interrupt completion callback only has access to [`UsbHidDevice`] via a
-/// raw context pointer. This trait provides a narrow, object-safe interface so
-/// the callback can arm a recovery timer without requiring the full (non-object-safe)
-/// `BootServices` trait.
-pub(crate) trait TransferRecoveryTimer {
-    /// Arms a one-shot timer event to fire after `delay_100ns` units of 100ns.
-    fn arm_recovery_timer(&self, event: efi::Event, delay_100ns: u64) -> Result<(), efi::Status>;
-}
-
-impl<T: BootServices> TransferRecoveryTimer for T {
-    fn arm_recovery_timer(&self, event: efi::Event, delay_100ns: u64) -> Result<(), efi::Status> {
-        self.set_timer(event, EventTimerType::Relative, delay_100ns)
-    }
-}
-
-/// Creates a recovery timer event whose notify function re-submits the async
-/// interrupt transfer on the given device.
+/// Registered as the closure body of the device's recovery timer event.
 ///
 /// # Safety
 ///
-/// `device_ptr` must point to a valid, heap-allocated [`UsbHidDevice`] that will
-/// remain valid for the lifetime of the returned event. The caller is responsible
-/// for closing the event (via [`BootServices::close_event`]) before the device is
-/// freed.
-pub unsafe fn create_recovery_event<U: BootServices>(
-    boot_services: &U,
-    device_ptr: *mut UsbHidDevice,
-) -> Result<efi::Event, efi::Status> {
-    // SAFETY: Caller guarantees device_ptr is valid for the event's lifetime.
-    // The event fires at TPL_CALLBACK, below the typical interrupt transfer TPL.
-    unsafe {
-        boot_services.create_event_unchecked::<UsbHidDevice>(
-            EventType::TIMER | EventType::NOTIFY_SIGNAL,
-            Tpl::CALLBACK,
-            Some(recovery_timer_notify),
-            device_ptr,
-        )
-    }
-}
-
-/// Timer notify function invoked after the recovery delay to re-submit async
-/// interrupt transfers following an error.
-extern "efiapi" fn recovery_timer_notify(_event: efi::Event, context: *mut UsbHidDevice) {
-    if context.is_null() {
+/// `device` must be null or point to a valid [`UsbHidDevice`]. The recovery event
+/// must be closed before the device is freed.
+pub(crate) unsafe fn recovery_timer_notify(device: *mut UsbHidDevice) {
+    // SAFETY: caller guarantees device is null or valid.
+    let Some(device) = (unsafe { device.as_mut() }) else {
         return;
-    }
-    // SAFETY: context is a valid UsbHidDevice pointer set during event creation.
-    let device = unsafe { &mut *context };
+    };
 
     // If the callback was unregistered while the timer was armed, do not re-submit.
     if device.report_callback.callback.is_none() {
@@ -154,9 +114,9 @@ unsafe extern "efiapi" fn on_report_interrupt_complete(
     // SAFETY: context is a pointer to UsbHidDevice set during transfer initiation.
     let device = unsafe { &mut *(context as *mut UsbHidDevice) };
 
-    if result != usb_io::USB_NOERROR {
+    if result != usb_io::NOERROR {
         // Handle stall by clearing the endpoint halt.
-        if (result & usb_io::USB_ERR_STALL) != 0 {
+        if (result & usb_io::ERR_STALL) != 0 {
             // SAFETY: usb_io is valid for the device's lifetime.
             let usb_io = unsafe { &*device.usb_io };
             let _ = control_transfers::usb_clear_endpoint_halt(
@@ -182,7 +142,9 @@ unsafe extern "efiapi" fn on_report_interrupt_complete(
         };
 
         // Arm the recovery timer for delayed re-submission.
-        let _ = device.timer_services.arm_recovery_timer(device.recovery_event, RECOVERY_DELAY_100NS);
+        if let Some(event) = device.recovery_event {
+            let _ = device.timer_services.set_timer(event, TimerType::Relative(RECOVERY_DELAY));
+        }
 
         return efi::Status::DEVICE_ERROR;
     }
@@ -210,6 +172,14 @@ mod test {
     use core::{
         cell::Cell,
         sync::atomic::{AtomicU16, AtomicUsize, Ordering},
+    };
+
+    use patina::component::service::{
+        Service,
+        uefi_services::{
+            event::Event,
+            timer_event::{MockTimerEventServices, TimerEventServices},
+        },
     };
 
     use crate::{
@@ -283,15 +253,13 @@ mod test {
         }
     }
 
-    // ---- No-op timer for tests that don't exercise recovery ----
+    // ---- Timer services for tests ----
 
-    struct NoopTransferRecoveryTimer;
-    impl TransferRecoveryTimer for NoopTransferRecoveryTimer {
-        fn arm_recovery_timer(&self, _event: efi::Event, _delay_100ns: u64) -> Result<(), efi::Status> {
-            Ok(())
-        }
+    fn noop_timer_services() -> Service<dyn TimerEventServices> {
+        let mut mock = MockTimerEventServices::new();
+        mock.expect_set_timer().returning(|_, _| Ok(()));
+        Service::mock(Box::new(mock))
     }
-    static NOOP_RECOVERY_TIMER: NoopTransferRecoveryTimer = NoopTransferRecoveryTimer;
 
     fn make_device(usb_io: &MockUsbIo) -> Box<UsbHidDevice> {
         Box::new(UsbHidDevice {
@@ -308,8 +276,8 @@ mod test {
                 report_descriptor: vec![0x05, 0x01],
             },
             report_callback: ReportCallbackState::default(),
-            timer_services: &NOOP_RECOVERY_TIMER,
-            recovery_event: core::ptr::null_mut(),
+            timer_services: noop_timer_services(),
+            recovery_event: None,
         })
     }
 
@@ -371,7 +339,7 @@ mod test {
                 report.as_ptr() as *mut c_void,
                 report.len(),
                 core::ptr::null_mut(),
-                usb_io::USB_NOERROR,
+                usb_io::NOERROR,
             )
         };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
@@ -406,7 +374,7 @@ mod test {
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // SAFETY: device_ptr is a valid UsbHidDevice.
         let status = unsafe {
-            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::USB_ERR_STALL)
+            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::ERR_STALL)
         };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
         // Should have called control transfer to clear endpoint halt.
@@ -427,7 +395,7 @@ mod test {
                 0x1000 as *mut c_void, // non-null
                 u16::MAX as usize + 1,
                 device_ptr as *mut c_void,
-                usb_io::USB_NOERROR,
+                usb_io::NOERROR,
             )
         };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
@@ -441,7 +409,7 @@ mod test {
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // SAFETY: device_ptr is a valid UsbHidDevice.
         let status = unsafe {
-            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::USB_NOERROR)
+            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::NOERROR)
         };
         assert_eq!(status, efi::Status::SUCCESS);
         core::mem::forget(device);
@@ -454,7 +422,7 @@ mod test {
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // SAFETY: device_ptr is a valid UsbHidDevice.
         let status = unsafe {
-            on_report_interrupt_complete(core::ptr::null_mut(), 8, device_ptr as *mut c_void, usb_io::USB_NOERROR)
+            on_report_interrupt_complete(core::ptr::null_mut(), 8, device_ptr as *mut c_void, usb_io::NOERROR)
         };
         assert_eq!(status, efi::Status::SUCCESS);
         core::mem::forget(device);
@@ -473,7 +441,7 @@ mod test {
                 report.as_ptr() as *mut c_void,
                 report.len(),
                 device_ptr as *mut c_void,
-                usb_io::USB_NOERROR,
+                usb_io::NOERROR,
             )
         };
         assert_eq!(status, efi::Status::SUCCESS);
@@ -509,7 +477,7 @@ mod test {
                 report.as_ptr() as *mut c_void,
                 report.len(),
                 device_ptr as *mut c_void,
-                usb_io::USB_NOERROR,
+                usb_io::NOERROR,
             )
         };
         assert_eq!(status, efi::Status::SUCCESS);
@@ -520,58 +488,37 @@ mod test {
 
     // ---- Timer-based recovery tests ----
 
-    /// Mock timer services for testing delayed recovery.
-    struct MockTransferRecoveryTimer {
-        arm_called: Cell<bool>,
-        arm_event: Cell<Option<efi::Event>>,
-        arm_delay: Cell<u64>,
+    fn sentinel_event() -> Event {
+        Event::from_raw(0xBEEF as *mut c_void).unwrap()
     }
 
-    impl MockTransferRecoveryTimer {
-        fn new() -> Self {
-            Self { arm_called: Cell::new(false), arm_event: Cell::new(None), arm_delay: Cell::new(0) }
-        }
+    /// Builds timer services that record each `set_timer` call into `calls`.
+    fn recording_timer_services(calls: &'static AtomicUsize) -> Service<dyn TimerEventServices> {
+        let mut mock = MockTimerEventServices::new();
+        mock.expect_set_timer()
+            .withf(|event, timer_type| *event == sentinel_event() && *timer_type == TimerType::Relative(RECOVERY_DELAY))
+            .returning(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        Service::mock(Box::new(mock))
     }
 
-    impl TransferRecoveryTimer for MockTransferRecoveryTimer {
-        fn arm_recovery_timer(&self, event: efi::Event, delay_100ns: u64) -> Result<(), efi::Status> {
-            self.arm_called.set(true);
-            self.arm_event.set(Some(event));
-            self.arm_delay.set(delay_100ns);
-            Ok(())
-        }
-    }
-
-    fn make_device_with_timer(usb_io: &MockUsbIo, timer_services: &MockTransferRecoveryTimer) -> Box<UsbHidDevice> {
-        // SAFETY: The timer_services reference is transmuted to 'static for storage in
-        // UsbHidDevice. The test ensures the MockTransferRecoveryTimer outlives the device.
-        let timer_ref: &'static dyn TransferRecoveryTimer =
-            unsafe { core::mem::transmute(timer_services as &dyn TransferRecoveryTimer) };
-        let sentinel_event = 0xBEEF as efi::Event;
-        Box::new(UsbHidDevice {
-            hid_io: hid_io_impl::new_hid_io_protocol(),
-            usb_io: &usb_io.protocol as *const usb_io::Protocol as *mut usb_io::Protocol,
-            descriptors: UsbHidDescriptors {
-                interface_descriptor: empty_usb_interface_descriptor(),
-                int_in_endpoint_descriptor: usb_io::EndpointDescriptor {
-                    endpoint_address: 0x81,
-                    interval: 10,
-                    max_packet_size: 8,
-                    ..empty_usb_endpoint_descriptor()
-                },
-                report_descriptor: vec![0x05, 0x01],
-            },
-            report_callback: ReportCallbackState::default(),
-            timer_services: timer_ref,
-            recovery_event: sentinel_event,
-        })
+    fn make_device_with_timer(
+        usb_io: &MockUsbIo,
+        timer_services: Service<dyn TimerEventServices>,
+    ) -> Box<UsbHidDevice> {
+        let mut device = make_device(usb_io);
+        device.timer_services = timer_services;
+        device.recovery_event = Some(sentinel_event());
+        device
     }
 
     #[test]
     fn callback_error_arms_recovery_timer_instead_of_immediate_resubmit() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
-        let mock_timer = MockTransferRecoveryTimer::new();
-        let mut device = make_device_with_timer(&mock_usb, &mock_timer);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut device = make_device_with_timer(&mock_usb, recording_timer_services(&CALLS));
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // SAFETY: device_ptr is a valid UsbHidDevice.
         let status = unsafe { on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, 0x01) };
@@ -579,21 +526,19 @@ mod test {
         // Should have called async transfer once (cancel only, no immediate re-submit).
         assert_eq!(mock_usb.async_call_count.get(), 1);
         // Recovery timer should have been armed.
-        assert!(mock_timer.arm_called.get());
-        assert_eq!(mock_timer.arm_event.get(), Some(0xBEEF as efi::Event));
-        assert_eq!(mock_timer.arm_delay.get(), RECOVERY_DELAY_100NS);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         core::mem::forget(device);
     }
 
     #[test]
     fn callback_stall_error_with_timer_clears_halt_and_arms_timer() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
-        let mock_timer = MockTransferRecoveryTimer::new();
-        let mut device = make_device_with_timer(&mock_usb, &mock_timer);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut device = make_device_with_timer(&mock_usb, recording_timer_services(&CALLS));
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // SAFETY: device_ptr is a valid UsbHidDevice.
         let status = unsafe {
-            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::USB_ERR_STALL)
+            on_report_interrupt_complete(core::ptr::null_mut(), 0, device_ptr as *mut c_void, usb_io::ERR_STALL)
         };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
         // Should have cleared endpoint halt via control transfer.
@@ -601,7 +546,7 @@ mod test {
         // Should have called async transfer once (cancel only).
         assert_eq!(mock_usb.async_call_count.get(), 1);
         // Recovery timer should have been armed.
-        assert!(mock_timer.arm_called.get());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         core::mem::forget(device);
     }
 
@@ -613,7 +558,8 @@ mod test {
         assert!(device.report_callback.callback.is_none());
         let device_ptr = &mut *device as *mut UsbHidDevice;
         // Simulate the recovery timer firing.
-        recovery_timer_notify(core::ptr::null_mut(), device_ptr);
+        // SAFETY: device_ptr is a valid UsbHidDevice.
+        unsafe { recovery_timer_notify(device_ptr) };
         // Should NOT have attempted to re-submit async transfers.
         assert_eq!(mock_usb.async_call_count.get(), 0);
         core::mem::forget(device);

@@ -53,7 +53,7 @@ regardless of the producer's calling TPL:
 Key crate dependencies (see `Cargo.toml` for the full list):
 
 - [`hidparser`](https://crates.io/crates/hidparser) — HID report descriptor parsing.
-- [`patina`](https://crates.io/crates/patina) — Patina component SDK (boot services, driver binding, protocol interfaces).
+- [`patina`](https://crates.io/crates/patina) — Patina component SDK (UEFI services: protocol, event, timer, and TPL services; driver binding).
 - [`r-efi`](https://crates.io/crates/r-efi) — Rust UEFI type definitions.
 
 ## Platform Integration
@@ -89,9 +89,16 @@ The `ctrl-alt-del` feature is enabled by default. To disable it:
 uefi_hid = { path = "../components/uefi_hid", default-features = false }
 ```
 
+## Known Limitations
+
+Patina's `EventServices` does not yet support creating `EVT_NOTIFY_WAIT` events. Until it does, the
+`WaitForKey` (SimpleTextIn), `WaitForKeyEx` (SimpleTextInEx), and `WaitForInput` (AbsolutePointer)
+events are placeholder timer events that are never armed or signaled, so `WaitForEvent()` on them
+will not complete. Consumers should poll `ReadKeyStroke`/`GetState` instead.
+
 ## Testing
 
-Unit tests use `mockall` and `patina`'s mock boot services:
+Unit tests use `mockall` and `patina`'s mock UEFI services:
 
 ```sh
 cargo test -p uefi_hid

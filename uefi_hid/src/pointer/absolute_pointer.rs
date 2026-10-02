@@ -9,52 +9,34 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use alloc::boxed::Box;
-use core::ptr;
 
 use r_efi::{efi, protocols};
 
 use hidparser::report_data_types::Usage;
 
-use patina::{
-    boot_services::{
-        BootServices,
-        c_ptr::PtrMetadata,
-        event::{EventNotifyCallback, EventType},
-        tpl::Tpl,
-    },
-    uefi_protocol::ProtocolInterface,
-};
+use patina::component::service::uefi_services::{event::Event, handle::Handle, protocol::ProtocolPtr};
 
 use super::{
     AXIS_RESOLUTION, BUTTON_MAX, BUTTON_MIN, DIGITIZER_SWITCH_MAX, DIGITIZER_SWITCH_MIN, GENERIC_DESKTOP_WHEEL,
     GENERIC_DESKTOP_X, GENERIC_DESKTOP_Y, GENERIC_DESKTOP_Z, PointerHidHandler,
 };
+use crate::{HidServices, to_status};
 
 /// FFI context
 /// # Safety
-/// A pointer to PointerHidHandler is included in the context so that it can be reclaimed in the absolute_pointer
-/// API implementation. Care must be taken to ensure that rust invariants are respected when accessing the
-/// PointerHidHandler. In particular, the design must ensure mutual exclusion on the PointerHidHandler between
-/// callbacks running at different TPL; this is accomplished by ensuring all access to the structure is at TPL_NOTIFY
-/// once initialization is complete.
+/// The handler must outlive this context and be accessed only through shared references derived from its root
+/// pointer. Mutable input state is protected by a TPL_NOTIFY mutex. If uninstall fails, both allocations stay alive.
 ///
 /// The absolute_pointer element must be the first element in the structure so that the full structure can be
 /// recovered by simple casting.
 #[repr(C)]
-pub(crate) struct AbsolutePointerFfi<T: BootServices + Clone + 'static> {
+pub(crate) struct AbsolutePointerFfi {
     absolute_pointer: protocols::absolute_pointer::Protocol,
-    boot_services: &'static T,
-    pointer_handler: *mut PointerHidHandler<T>,
+    services: HidServices,
+    pointer_handler: *const PointerHidHandler,
 }
 
-// SAFETY: AbsolutePointerFfi<T> is #[repr(C)] with protocols::absolute_pointer::Protocol as its
-// first field, so a pointer to AbsolutePointerFfi<T> is a valid pointer to Protocol per the
-// first-field casting pattern.
-unsafe impl<T: BootServices + Clone + 'static> ProtocolInterface for AbsolutePointerFfi<T> {
-    const PROTOCOL_GUID: patina::BinaryGuid = patina::BinaryGuid(protocols::absolute_pointer::PROTOCOL_GUID);
-}
-
-impl<T: BootServices + Clone + 'static> Drop for AbsolutePointerFfi<T> {
+impl Drop for AbsolutePointerFfi {
     fn drop(&mut self) {
         if !self.absolute_pointer.mode.is_null() {
             // SAFETY: mode was created via Box::into_raw during install and is non-null (checked above).
@@ -63,48 +45,50 @@ impl<T: BootServices + Clone + 'static> Drop for AbsolutePointerFfi<T> {
     }
 }
 
-impl<T: BootServices + Clone + 'static> AbsolutePointerFfi<T> {
-    /// Installs the absolute pointer protocol. If successful, returns the key required to uninstall.
+impl AbsolutePointerFfi {
+    /// Installs the absolute pointer protocol. If successful, returns the installed context pointer, which must be
+    /// passed to [`Self::uninstall`].
     pub(crate) fn install(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        pointer_handler: &mut PointerHidHandler<T>,
-    ) -> Result<PtrMetadata<'static, Box<Self>>, efi::Status> {
-        let mut pointer_ctx = Box::new(AbsolutePointerFfi {
+        services: HidServices,
+        controller: Handle,
+        pointer_handler: *const PointerHidHandler,
+        mode: protocols::absolute_pointer::Mode,
+    ) -> Result<*mut Self, efi::Status> {
+        // TODO: wait_for_input must be a NOTIFY_WAIT event whose notify function calls
+        // `signal_if_input_available`. Patina EventServices does not yet support creating NOTIFY_WAIT events, so an
+        // unarmed timer event with no notify function is used as a placeholder. Until this is replaced, WaitForEvent
+        // on wait_for_input will not complete.
+        let wait_for_input_event = services.timers.create_timer_event_no_notify().map_err(to_status)?;
+
+        let pointer_ctx = Box::into_raw(Box::new(AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
                 reset: Self::absolute_pointer_reset,
                 get_state: Self::absolute_pointer_get_state,
-                mode: Box::into_raw(Box::new(Self::initialize_mode(pointer_handler))),
-                wait_for_input: ptr::null_mut(),
+                mode: Box::into_raw(Box::new(mode)),
+                wait_for_input: wait_for_input_event.as_raw(),
             },
-            boot_services,
-            pointer_handler: pointer_handler as *mut PointerHidHandler<T>,
-        });
+            services,
+            pointer_handler,
+        }));
 
-        let ctx_ptr: *mut Self = &mut *pointer_ctx;
-
-        let wait_for_input_event = boot_services.create_event(
-            EventType::NOTIFY_WAIT,
-            Tpl::NOTIFY,
-            Some(Self::absolute_pointer_wait_for_input as EventNotifyCallback<*mut Self>),
-            ctx_ptr,
-        )?;
-
-        pointer_ctx.absolute_pointer.wait_for_input = wait_for_input_event;
-
-        match boot_services.install_protocol_interface(Some(controller), pointer_ctx) {
-            Ok((_handle, key)) => Ok(key),
-            Err(status) => {
-                // install_protocol_interface reconstructs and drops the Box on failure (freeing mode
-                // via AbsolutePointerFfi::Drop), but doesn't know about our event.
-                let _ = boot_services.close_event(wait_for_input_event);
-                Err(status)
+        let interface = ProtocolPtr::from_raw(pointer_ctx.cast()).expect("Box pointers are non-null");
+        match services.protocols.install_interface(
+            Some(controller),
+            protocols::absolute_pointer::PROTOCOL_GUID.into(),
+            interface,
+        ) {
+            Ok(_) => Ok(pointer_ctx),
+            Err(error) => {
+                let _ = services.events.close_event(wait_for_input_event);
+                // SAFETY: pointer_ctx was created by Box::into_raw above and was not published.
+                drop(unsafe { Box::from_raw(pointer_ctx) });
+                Err(to_status(error))
             }
         }
     }
 
     // Initializes the absolute_pointer mode structure.
-    fn initialize_mode(pointer_handler: &PointerHidHandler<T>) -> protocols::absolute_pointer::Mode {
+    pub(super) fn initialize_mode(pointer_handler: &PointerHidHandler) -> protocols::absolute_pointer::Mode {
         let mut mode: protocols::absolute_pointer::Mode = Default::default();
 
         if pointer_handler.processor.supported_usages.contains(&Usage::from(GENERIC_DESKTOP_X)) {
@@ -143,54 +127,49 @@ impl<T: BootServices + Clone + 'static> AbsolutePointerFfi<T> {
         mode
     }
 
-    /// Uninstalls the absolute pointer protocol
+    /// Uninstalls the absolute pointer protocol and frees the context created by [`Self::install`].
     pub(crate) fn uninstall(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        key: PtrMetadata<'static, Box<Self>>,
+        services: HidServices,
+        controller: Handle,
+        pointer_ctx: *mut Self,
     ) -> Result<(), efi::Status> {
-        // Save the raw pointer before consuming key, in case uninstall fails.
-        let raw_ptr = key.ptr_value as *mut AbsolutePointerFfi<T>;
+        let interface = ProtocolPtr::from_raw(pointer_ctx.cast()).ok_or(efi::Status::INVALID_PARAMETER)?;
+        if let Err(error) = services.protocols.uninstall_interface(
+            controller,
+            protocols::absolute_pointer::PROTOCOL_GUID.into(),
+            interface,
+        ) {
+            log::error!("Failed to uninstall absolute_pointer interface: {:?}", error);
+            // The caller must retain the handler while this context is still installed.
+            return Err(to_status(error));
+        }
 
-        let pointer_ctx = match boot_services.uninstall_protocol_interface(controller, key) {
-            Ok(ctx) => ctx,
-            Err(status) => {
-                log::error!("Failed to uninstall absolute_pointer interface, status: {:x?}", status);
-                // Protocol is still installed. Null pointer_handler so callbacks don't access a
-                // dropped PointerHidHandler.
-                // SAFETY: raw_ptr was saved before uninstall consumed the key; protocol is still installed so memory is valid.
-                unsafe {
-                    if let Some(ctx) = raw_ptr.as_mut() {
-                        ctx.pointer_handler = ptr::null_mut();
-                    }
-                }
-                return Err(status);
-            }
-        };
+        // SAFETY: pointer_ctx was created via Box::into_raw in install and is no longer published.
+        let pointer_ctx = unsafe { Box::from_raw(pointer_ctx) };
 
-        if let Err(status) = boot_services.close_event(pointer_ctx.absolute_pointer.wait_for_input) {
-            log::error!("Failed to close absolute_pointer.wait_for_input event, status: {:x?}", status);
-            // Leak pointer_ctx so the still-live event callback doesn't use freed memory.
+        if let Some(event) = Event::from_raw(pointer_ctx.absolute_pointer.wait_for_input)
+            && let Err(error) = services.events.close_event(event)
+        {
+            log::error!("Failed to close absolute_pointer.wait_for_input event: {:?}", error);
+            // Leak pointer_ctx so a still-live event callback doesn't use freed memory.
             core::mem::forget(pointer_ctx);
-            return Err(status);
+            return Err(to_status(error));
         }
 
         // pointer_ctx drops here, freeing the mode allocation via AbsolutePointerFfi::Drop.
         Ok(())
     }
 
-    // Handles the wait_for_input event — part of the absolute_pointer protocol interface.
-    extern "efiapi" fn absolute_pointer_wait_for_input(event: efi::Event, context: *mut Self) {
-        if context.is_null() {
-            log::error!("absolute_pointer_wait_for_input invoked with invalid context");
-            return;
-        }
-        // SAFETY: context pointer is non-null (checked above) and valid for the lifetime of the UEFI event callback.
-        let context = unsafe { context.as_ref() }.expect("context pointer should not be null");
+    /// Signals `event` if pointer input is available.
+    ///
+    /// This is the notify logic for the wait_for_input event.
+    // TODO: invoke from the wait_for_input NOTIFY_WAIT notify function once Patina EventServices supports it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn signal_if_input_available(&self, event: Event) {
         // SAFETY: pointer_handler validity is ensured by the protocol lifecycle.
-        if let Some(pointer_handler) = unsafe { context.pointer_handler.as_ref() } {
+        if let Some(pointer_handler) = unsafe { self.pointer_handler.as_ref() } {
             if pointer_handler.state.lock().state_changed {
-                let _ = context.boot_services.signal_event(event);
+                let _ = self.services.events.signal_event(event);
             }
         } else {
             log::error!("absolute_pointer_wait_for_input invoked after pointer dropped.");
@@ -207,7 +186,7 @@ impl<T: BootServices + Clone + 'static> AbsolutePointerFfi<T> {
         }
         // SAFETY: this is the first field of #[repr(C)] AbsolutePointerFfi, non-null (checked above).
         let context =
-            unsafe { (this as *const AbsolutePointerFfi<T>).as_ref() }.expect("context pointer should not be null");
+            unsafe { (this as *const AbsolutePointerFfi).as_ref() }.expect("context pointer should not be null");
         // SAFETY: pointer_handler validity is ensured by the protocol lifecycle.
         if let Some(pointer_handler) = unsafe { context.pointer_handler.as_ref() } {
             pointer_handler.state.lock().reset();
@@ -229,7 +208,7 @@ impl<T: BootServices + Clone + 'static> AbsolutePointerFfi<T> {
 
         // SAFETY: this is the first field of #[repr(C)] AbsolutePointerFfi, non-null (checked above).
         let context =
-            unsafe { (this as *const AbsolutePointerFfi<T>).as_ref() }.expect("context pointer should not be null");
+            unsafe { (this as *const AbsolutePointerFfi).as_ref() }.expect("context pointer should not be null");
         // SAFETY: pointer_handler validity is ensured by the protocol lifecycle.
         if let Some(pointer_handler) = unsafe { context.pointer_handler.as_ref() } {
             let mut pointer_state = pointer_handler.state.lock();
@@ -252,44 +231,46 @@ impl<T: BootServices + Clone + 'static> AbsolutePointerFfi<T> {
 
 #[cfg(test)]
 mod test {
-    use core::ptr;
+    use core::{
+        ptr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use alloc::boxed::Box;
     use r_efi::{efi, protocols};
 
     use hidparser::report_data_types::Usage;
-    use patina::boot_services::MockBootServices;
-
-    use super::*;
-    use crate::pointer::{
-        AXIS_RESOLUTION, BUTTON_MIN, CENTER, GENERIC_DESKTOP_WHEEL, GENERIC_DESKTOP_X, GENERIC_DESKTOP_Y,
-        GENERIC_DESKTOP_Z, PointerHidHandler,
+    use patina::{
+        component::service::uefi_services::{event::EventError, protocol::ProtocolError},
+        error::EfiError,
     };
 
-    fn mock_boot_services() -> &'static mut MockBootServices {
-        let mut mock = MockBootServices::new();
-        mock.expect_raise_tpl().returning(|_| patina::boot_services::tpl::Tpl::APPLICATION);
-        mock.expect_restore_tpl().returning(|_| ());
-        // SAFETY: Leaked mock for test use with 'static lifetime requirement.
-        unsafe { Box::into_raw(Box::new(mock)).as_mut().unwrap() }
+    use super::*;
+    use crate::{
+        pointer::{
+            AXIS_RESOLUTION, BUTTON_MIN, CENTER, GENERIC_DESKTOP_WHEEL, GENERIC_DESKTOP_X, GENERIC_DESKTOP_Y,
+            GENERIC_DESKTOP_Z, PointerHidHandler,
+        },
+        test_stubs::{mock_services, test_event, test_handle},
+    };
+
+    fn mock_boot_services() -> HidServices {
+        mock_services(|_, _, _| {})
     }
 
     /// Builds a test AbsolutePointerFfi context wired to the given handler. The caller must ensure
     /// `handler` outlives the returned context. The returned context has a null `wait_for_input`
     /// event (not needed for callback unit tests) and a heap-allocated mode.
-    fn test_context(
-        boot_services: &'static MockBootServices,
-        handler: &mut PointerHidHandler<MockBootServices>,
-    ) -> AbsolutePointerFfi<MockBootServices> {
+    fn test_context(boot_services: HidServices, handler: &PointerHidHandler) -> AbsolutePointerFfi {
         AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
-                reset: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset,
-                get_state: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state,
+                reset: AbsolutePointerFfi::absolute_pointer_reset,
+                get_state: AbsolutePointerFfi::absolute_pointer_get_state,
                 mode: Box::into_raw(Box::new(AbsolutePointerFfi::initialize_mode(handler))),
                 wait_for_input: ptr::null_mut(),
             },
-            boot_services,
-            pointer_handler: handler as *mut PointerHidHandler<MockBootServices>,
+            services: boot_services,
+            pointer_handler: handler,
         }
     }
 
@@ -376,14 +357,14 @@ mod test {
 
     #[test]
     fn reset_returns_invalid_parameter_on_null() {
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset(ptr::null_mut(), false);
+        let status = AbsolutePointerFfi::absolute_pointer_reset(ptr::null_mut(), false);
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
     }
 
     #[test]
     fn reset_clears_state() {
         let boot_services = mock_boot_services();
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
+        let handler = PointerHidHandler::new_for_test(boot_services);
         // Set up some non-default state.
         {
             let mut state = handler.state.lock();
@@ -391,9 +372,8 @@ mod test {
             state.state_changed = true;
         }
 
-        let mut ctx = test_context(boot_services, &mut handler);
-        let status =
-            AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset(&mut ctx.absolute_pointer as *mut _, false);
+        let mut ctx = test_context(boot_services, &handler);
+        let status = AbsolutePointerFfi::absolute_pointer_reset(&mut ctx.absolute_pointer as *mut _, false);
 
         assert_eq!(status, efi::Status::SUCCESS);
         let state = handler.state.lock();
@@ -407,23 +387,22 @@ mod test {
         let boot_services = mock_boot_services();
         let mut ctx = AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
-                reset: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset,
-                get_state: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state,
+                reset: AbsolutePointerFfi::absolute_pointer_reset,
+                get_state: AbsolutePointerFfi::absolute_pointer_get_state,
                 mode: ptr::null_mut(),
                 wait_for_input: ptr::null_mut(),
             },
-            boot_services,
+            services: boot_services,
             pointer_handler: ptr::null_mut(),
         };
 
-        let status =
-            AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset(&mut ctx.absolute_pointer as *mut _, false);
+        let status = AbsolutePointerFfi::absolute_pointer_reset(&mut ctx.absolute_pointer as *mut _, false);
         assert_eq!(status, efi::Status::DEVICE_ERROR);
     }
 
     #[test]
     fn get_state_returns_invalid_parameter_on_null_this() {
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state(
+        let status = AbsolutePointerFfi::absolute_pointer_get_state(
             ptr::null_mut(),
             &mut protocols::absolute_pointer::State::default(),
         );
@@ -433,34 +412,29 @@ mod test {
     #[test]
     fn get_state_returns_invalid_parameter_on_null_state() {
         let boot_services = mock_boot_services();
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let mut ctx = test_context(boot_services, &mut handler);
+        let handler = PointerHidHandler::new_for_test(boot_services);
+        let mut ctx = test_context(boot_services, &handler);
 
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state(
-            &mut ctx.absolute_pointer as *mut _,
-            ptr::null_mut(),
-        );
+        let status =
+            AbsolutePointerFfi::absolute_pointer_get_state(&mut ctx.absolute_pointer as *mut _, ptr::null_mut());
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
     }
 
     #[test]
     fn get_state_returns_not_ready_when_unchanged() {
         let boot_services = mock_boot_services();
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let mut ctx = test_context(boot_services, &mut handler);
+        let handler = PointerHidHandler::new_for_test(boot_services);
+        let mut ctx = test_context(boot_services, &handler);
         let mut state = protocols::absolute_pointer::State::default();
 
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state(
-            &mut ctx.absolute_pointer as *mut _,
-            &mut state,
-        );
+        let status = AbsolutePointerFfi::absolute_pointer_get_state(&mut ctx.absolute_pointer as *mut _, &mut state);
         assert_eq!(status, efi::Status::NOT_READY);
     }
 
     #[test]
     fn get_state_returns_state_and_clears_flag() {
         let boot_services = mock_boot_services();
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
+        let handler = PointerHidHandler::new_for_test(boot_services);
         {
             let mut state = handler.state.lock();
             state.current_state.current_x = 200;
@@ -469,13 +443,11 @@ mod test {
             state.state_changed = true;
         }
 
-        let mut ctx = test_context(boot_services, &mut handler);
+        let mut ctx = test_context(boot_services, &handler);
         let mut out_state = protocols::absolute_pointer::State::default();
 
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state(
-            &mut ctx.absolute_pointer as *mut _,
-            &mut out_state,
-        );
+        let status =
+            AbsolutePointerFfi::absolute_pointer_get_state(&mut ctx.absolute_pointer as *mut _, &mut out_state);
 
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(out_state.current_x, 200);
@@ -490,16 +462,16 @@ mod test {
         let boot_services = mock_boot_services();
         let mut ctx = AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
-                reset: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset,
-                get_state: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state,
+                reset: AbsolutePointerFfi::absolute_pointer_reset,
+                get_state: AbsolutePointerFfi::absolute_pointer_get_state,
                 mode: ptr::null_mut(),
                 wait_for_input: ptr::null_mut(),
             },
-            boot_services,
+            services: boot_services,
             pointer_handler: ptr::null_mut(),
         };
 
-        let status = AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state(
+        let status = AbsolutePointerFfi::absolute_pointer_get_state(
             &mut ctx.absolute_pointer as *mut _,
             &mut protocols::absolute_pointer::State::default(),
         );
@@ -507,176 +479,188 @@ mod test {
     }
 
     #[test]
-    fn wait_for_input_signals_event_when_state_changed() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_signal_event().times(1).returning(|_| Ok(()));
+    fn signal_if_input_available_signals_event_when_state_changed() {
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|_, events, _| {
+            events.expect_signal_event().returning(|event| {
+                assert_eq!(event, test_event(0x1234));
+                SIGNALS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
+        let handler = PointerHidHandler::new_for_test(services);
         handler.state.lock().state_changed = true;
 
-        let mut ctx = test_context(boot_services, &mut handler);
-        let event = 0x1234 as efi::Event;
-
-        AbsolutePointerFfi::<MockBootServices>::absolute_pointer_wait_for_input(event, &mut ctx);
+        let ctx = test_context(services, &handler);
+        ctx.signal_if_input_available(test_event(0x1234));
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn wait_for_input_does_not_signal_when_unchanged() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_signal_event().never();
+    fn signal_if_input_available_does_not_signal_when_unchanged() {
+        let services = mock_services(|_, events, _| {
+            events.expect_signal_event().never();
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
+        let handler = PointerHidHandler::new_for_test(services);
         // state_changed defaults to false.
 
-        let mut ctx = test_context(boot_services, &mut handler);
-        let event = 0x1234 as efi::Event;
-
-        AbsolutePointerFfi::<MockBootServices>::absolute_pointer_wait_for_input(event, &mut ctx);
+        let ctx = test_context(services, &handler);
+        ctx.signal_if_input_available(test_event(0x1234));
     }
 
     #[test]
-    fn wait_for_input_handles_null_context() {
-        let event = 0x1234 as efi::Event;
+    fn signal_if_input_available_handles_dropped_pointer() {
+        let services = mock_services(|_, events, _| {
+            events.expect_signal_event().never();
+        });
+        let handler = PointerHidHandler::new_for_test(services);
+        let mut ctx = test_context(services, &handler);
+        ctx.pointer_handler = ptr::null_mut();
         // Should log an error but not panic.
-        AbsolutePointerFfi::<MockBootServices>::absolute_pointer_wait_for_input(event, ptr::null_mut());
+        ctx.signal_if_input_available(test_event(0x1234));
     }
 
     // --- install/uninstall tests ---
 
-    /// Creates a leaked `AbsolutePointerFfi` box and returns its `PtrMetadata` key,
-    /// simulating the state after a successful `install`. The caller is responsible for
-    /// ensuring the leaked allocation is cleaned up (either via `uninstall_protocol_interface`
-    /// reconstructing the Box, or manual `Box::from_raw`).
-    fn leaked_context_key(
-        boot_services: &'static MockBootServices,
-        handler: &mut PointerHidHandler<MockBootServices>,
-    ) -> PtrMetadata<'static, Box<AbsolutePointerFfi<MockBootServices>>> {
-        use patina::boot_services::c_ptr::CPtr;
-
-        let ctx = Box::new(AbsolutePointerFfi {
+    /// Creates a leaked `AbsolutePointerFfi` box, simulating the state after a successful `install`. The caller is
+    /// responsible for ensuring the leaked allocation is cleaned up.
+    fn leaked_context(services: HidServices, handler: &PointerHidHandler) -> *mut AbsolutePointerFfi {
+        Box::into_raw(Box::new(AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
-                reset: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_reset,
-                get_state: AbsolutePointerFfi::<MockBootServices>::absolute_pointer_get_state,
+                reset: AbsolutePointerFfi::absolute_pointer_reset,
+                get_state: AbsolutePointerFfi::absolute_pointer_get_state,
                 mode: Box::into_raw(Box::new(protocols::absolute_pointer::Mode::default())),
-                wait_for_input: 0x42 as efi::Event,
+                wait_for_input: test_event(0x42).as_raw(),
             },
-            boot_services,
-            pointer_handler: handler as *mut _,
-        });
-        let key = ctx.metadata();
-        let _ = Box::into_raw(ctx);
-        key
+            services,
+            pointer_handler: handler,
+        }))
     }
 
-    type AbsPtr = AbsolutePointerFfi<MockBootServices>;
-
     #[test]
-    fn install_succeeds() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_create_event::<*mut AbsPtr>().times(1).returning(|_, _, _, _| Ok(0x42 as efi::Event));
-        boot_services.expect_install_protocol_interface::<AbsPtr, Box<AbsPtr>>().times(1).returning(
-            |_, protocol_interface| {
-                use patina::boot_services::c_ptr::CPtr;
-                let key = protocol_interface.metadata();
-                let _ = Box::into_raw(protocol_interface);
-                Ok((0x1 as efi::Handle, key))
-            },
-        );
+    fn install_succeeds_with_unarmed_wait_event() {
+        let services = mock_services(|protocols, _, timers| {
+            timers.expect_create_timer_event_no_notify().returning(|| Ok(test_event(0x42)));
+            // The placeholder wait event must never be armed.
+            timers.expect_set_timer().never();
+            protocols.expect_install_interface().returning(|handle, guid, interface| {
+                assert_eq!(handle, Some(test_handle(0x2)));
+                assert_eq!(guid, protocols::absolute_pointer::PROTOCOL_GUID);
+                // SAFETY: interface is the AbsolutePointerFfi context created by install.
+                let ctx = unsafe { &*(interface.as_raw() as *const AbsolutePointerFfi) };
+                assert_eq!(ctx.absolute_pointer.wait_for_input, test_event(0x42).as_raw());
+                Ok(test_handle(0x2))
+            });
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let result = AbsolutePointerFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
-        assert!(result.is_ok());
+        let handler = PointerHidHandler::new_for_test(services);
+        let ctx = AbsolutePointerFfi::install(
+            services,
+            test_handle(0x2),
+            &handler,
+            AbsolutePointerFfi::initialize_mode(&handler),
+        )
+        .unwrap();
 
-        // Clean up the leaked box.
-        let key = result.unwrap();
-        // SAFETY: Reclaiming the Box leaked by the mock install_protocol_interface.
-        drop(unsafe { Box::from_raw(key.ptr_value as *mut AbsPtr) });
+        // SAFETY: Reclaiming the Box leaked by install.
+        drop(unsafe { Box::from_raw(ctx) });
     }
 
     #[test]
     fn install_returns_error_on_create_event_failure() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_create_event::<*mut AbsPtr>()
-            .times(1)
-            .returning(|_, _, _, _| Err(efi::Status::OUT_OF_RESOURCES));
-        boot_services.expect_install_protocol_interface::<AbsPtr, Box<AbsPtr>>().never();
+        let services = mock_services(|protocols, _, timers| {
+            timers.expect_create_timer_event_no_notify().returning(|| Err(EventError::Internal));
+            protocols.expect_install_interface().never();
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let result = AbsolutePointerFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
-        assert_eq!(result.err(), Some(efi::Status::OUT_OF_RESOURCES));
+        let handler = PointerHidHandler::new_for_test(services);
+        let result = AbsolutePointerFfi::install(
+            services,
+            test_handle(0x2),
+            &handler,
+            AbsolutePointerFfi::initialize_mode(&handler),
+        );
+        assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
     }
 
     #[test]
     fn install_cleans_up_event_on_install_protocol_failure() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_create_event::<*mut AbsPtr>().times(1).returning(|_, _, _, _| Ok(0x42 as efi::Event));
-        boot_services
-            .expect_install_protocol_interface::<AbsPtr, Box<AbsPtr>>()
-            .times(1)
-            .returning(|_, _| Err(efi::Status::ACCESS_DENIED));
-        // close_event must be called to clean up the event on install failure.
-        boot_services.expect_close_event().times(1).returning(|_| Ok(()));
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_install_interface().returning(|_, _, _| Err(ProtocolError::AccessDenied));
+            // close_event must be called to clean up the event on install failure.
+            events.expect_close_event().returning(|_| {
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let result = AbsolutePointerFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
+        let handler = PointerHidHandler::new_for_test(services);
+        let result = AbsolutePointerFfi::install(
+            services,
+            test_handle(0x2),
+            &handler,
+            AbsolutePointerFfi::initialize_mode(&handler),
+        );
         assert_eq!(result.err(), Some(efi::Status::ACCESS_DENIED));
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn uninstall_succeeds() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_uninstall_protocol_interface::<AbsPtr, Box<AbsPtr>>().times(1).returning(|_, key| {
-            // SAFETY: Reclaiming the Box from the key, mirroring the real uninstall_protocol_interface.
-            Ok(unsafe { Box::from_raw(key.ptr_value as *mut AbsPtr) })
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_uninstall_interface().returning(|handle, guid, _| {
+                assert_eq!(handle, test_handle(0x2));
+                assert_eq!(guid, protocols::absolute_pointer::PROTOCOL_GUID);
+                Ok(())
+            });
+            events.expect_close_event().returning(|event| {
+                assert_eq!(event, test_event(0x42));
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
         });
-        boot_services.expect_close_event().times(1).returning(|_| Ok(()));
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
+        let handler = PointerHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &handler);
 
-        let result = AbsolutePointerFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
-        assert_eq!(result, Ok(()));
+        assert_eq!(AbsolutePointerFfi::uninstall(services, test_handle(0x2), ctx), Ok(()));
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn uninstall_failure_nulls_pointer_handler() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_uninstall_protocol_interface::<AbsPtr, Box<AbsPtr>>()
-            .times(1)
-            .returning(|_, _| Err(efi::Status::ACCESS_DENIED));
+    fn uninstall_failure_keeps_context() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_uninstall_interface().returning(|_, _, _| Err(ProtocolError::AccessDenied));
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
-        let raw_ptr = key.ptr_value as *mut AbsPtr;
+        let handler = PointerHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &handler);
 
-        let result = AbsolutePointerFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
+        let result = AbsolutePointerFfi::uninstall(services, test_handle(0x2), ctx);
         assert_eq!(result, Err(efi::Status::ACCESS_DENIED));
 
-        // Verify pointer_handler was nulled as a safety measure.
-        // SAFETY: raw_ptr points to the still-live leaked context (uninstall failed).
-        let ctx = unsafe { raw_ptr.as_ref() }.unwrap();
-        assert!(ctx.pointer_handler.is_null());
+        // SAFETY: ctx points to the still-live leaked context (uninstall failed).
+        assert_eq!(unsafe { &*ctx }.pointer_handler, &raw const handler);
 
         // SAFETY: Reclaiming the leaked context Box for cleanup.
-        drop(unsafe { Box::from_raw(raw_ptr) });
+        drop(unsafe { Box::from_raw(ctx) });
     }
 
     #[test]
     fn uninstall_returns_error_on_close_event_failure() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_uninstall_protocol_interface::<AbsPtr, Box<AbsPtr>>()
-            .times(1)
-            // SAFETY: Reclaiming the Box from the key, mirroring the real uninstall_protocol_interface.
-            .returning(|_, key| Ok(unsafe { Box::from_raw(key.ptr_value as *mut AbsPtr) }));
-        boot_services.expect_close_event().times(1).returning(|_| Err(efi::Status::INVALID_PARAMETER));
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            events.expect_close_event().returning(|_| Err(EfiError::InvalidParameter.into()));
+        });
 
-        let mut handler = PointerHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
+        let handler = PointerHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &handler);
 
-        let result = AbsolutePointerFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
+        let result = AbsolutePointerFfi::uninstall(services, test_handle(0x2), ctx);
         assert_eq!(result, Err(efi::Status::INVALID_PARAMETER));
     }
 }

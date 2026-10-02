@@ -39,7 +39,7 @@ handles USB transfer errors.
 
 Key crate dependencies (see `Cargo.toml` for the full list):
 
-- [`patina`](https://crates.io/crates/patina) — Patina component SDK (boot services, driver binding, protocol interfaces).
+- [`patina`](https://crates.io/crates/patina) — Patina component SDK (UEFI services: protocol, event, timer, and TPL services; driver binding).
 - [`r-efi`](https://crates.io/crates/r-efi) — Rust UEFI type definitions.
 
 ## Platform Integration
@@ -71,7 +71,7 @@ HidIo protocol to be functional.
 
 ## Testing
 
-Unit tests use `mockall` and `patina`'s mock boot services:
+Unit tests use `mockall` and `patina`'s mock UEFI services:
 
 ```sh
 cargo test -p usb_hid

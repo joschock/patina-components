@@ -10,21 +10,13 @@
 //!
 
 use alloc::boxed::Box;
-use core::ptr;
 
 use r_efi::{efi, protocols};
 
-use patina::{
-    boot_services::{
-        BootServices,
-        c_ptr::PtrMetadata,
-        event::{EventNotifyCallback, EventType},
-        tpl::Tpl,
-    },
-    uefi_protocol::ProtocolInterface,
-};
+use patina::component::service::uefi_services::{event::Event, handle::Handle, protocol::ProtocolPtr};
 
 use super::KeyboardHidHandler;
+use crate::{HidServices, to_status};
 
 /// FFI context for SimpleTextInput protocol.
 ///
@@ -34,89 +26,75 @@ use super::KeyboardHidHandler;
 /// The simple_text_in protocol element must be the first element in the structure so that the full structure can be
 /// recovered by simple casting.
 #[repr(C)]
-pub(crate) struct SimpleTextInFfi<T: BootServices + Clone + 'static> {
+pub(crate) struct SimpleTextInFfi {
     simple_text_in: protocols::simple_text_input::Protocol,
-    pub(crate) boot_services: &'static T,
-    pub(crate) keyboard_handler: *mut KeyboardHidHandler<T>,
+    pub(crate) services: HidServices,
+    pub(crate) keyboard_handler: *const KeyboardHidHandler,
 }
 
-// SAFETY: SimpleTextInFfi<T> is #[repr(C)] with protocols::simple_text_input::Protocol as its
-// first field, so a pointer to SimpleTextInFfi<T> is a valid pointer to Protocol per the
-// first-field casting pattern.
-unsafe impl<T: BootServices + Clone + 'static> ProtocolInterface for SimpleTextInFfi<T> {
-    const PROTOCOL_GUID: patina::BinaryGuid = patina::BinaryGuid(protocols::simple_text_input::PROTOCOL_GUID);
-}
-
-impl<T: BootServices + Clone + 'static> SimpleTextInFfi<T> {
-    /// Installs the simple text in protocol. Returns the key required to uninstall.
+impl SimpleTextInFfi {
+    /// Installs the simple text in protocol. Returns the installed context pointer, which must be passed to
+    /// [`Self::uninstall`].
     pub(crate) fn install(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        keyboard_handler: &mut KeyboardHidHandler<T>,
-    ) -> Result<PtrMetadata<'static, Box<Self>>, efi::Status> {
-        let mut ctx = Box::new(SimpleTextInFfi {
+        services: HidServices,
+        controller: Handle,
+        keyboard_handler: *const KeyboardHidHandler,
+    ) -> Result<*mut Self, efi::Status> {
+        // TODO: wait_for_key must be a NOTIFY_WAIT event whose notify function calls `signal_if_key_available`.
+        // Patina EventServices does not yet support creating NOTIFY_WAIT events, so an unarmed timer event with no
+        // notify function is used as a placeholder. Until this is replaced, WaitForEvent on wait_for_key will not
+        // complete.
+        let wait_for_key_event = services.timers.create_timer_event_no_notify().map_err(to_status)?;
+
+        let ctx = Box::into_raw(Box::new(SimpleTextInFfi {
             simple_text_in: protocols::simple_text_input::Protocol {
                 reset: Self::simple_text_in_reset,
                 read_key_stroke: Self::simple_text_in_read_key_stroke,
-                wait_for_key: ptr::null_mut(),
+                wait_for_key: wait_for_key_event.as_raw(),
             },
-            boot_services,
-            keyboard_handler: keyboard_handler as *mut KeyboardHidHandler<T>,
-        });
+            services,
+            keyboard_handler,
+        }));
 
-        let ctx_ptr: *mut Self = &mut *ctx;
-
-        let wait_for_key_event = boot_services.create_event(
-            EventType::NOTIFY_WAIT,
-            Tpl::NOTIFY,
-            Some(Self::simple_text_in_wait_for_key as EventNotifyCallback<*mut Self>),
-            ctx_ptr,
-        )?;
-
-        ctx.simple_text_in.wait_for_key = wait_for_key_event;
-
-        match boot_services.install_protocol_interface(Some(controller), ctx) {
-            Ok((_handle, key)) => Ok(key),
-            Err(status) => {
-                // install_protocol_interface reconstructs and drops the Box on failure,
-                // but doesn't know about our event.
-                let _ = boot_services.close_event(wait_for_key_event);
-                Err(status)
+        let interface = ProtocolPtr::from_raw(ctx.cast()).expect("Box pointers are non-null");
+        match services.protocols.install_interface(
+            Some(controller),
+            protocols::simple_text_input::PROTOCOL_GUID.into(),
+            interface,
+        ) {
+            Ok(_) => Ok(ctx),
+            Err(error) => {
+                let _ = services.events.close_event(wait_for_key_event);
+                // SAFETY: ctx was created by Box::into_raw above and was not published.
+                drop(unsafe { Box::from_raw(ctx) });
+                Err(to_status(error))
             }
         }
     }
 
-    /// Uninstalls the simple text in protocol using the key from install.
-    pub(crate) fn uninstall(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        key: PtrMetadata<'static, Box<Self>>,
-    ) -> Result<(), efi::Status> {
-        // Save the raw pointer before consuming key, in case uninstall fails.
-        let raw_ptr = key.ptr_value as *mut SimpleTextInFfi<T>;
+    /// Uninstalls the simple text in protocol and frees the context created by [`Self::install`].
+    pub(crate) fn uninstall(services: HidServices, controller: Handle, ctx: *mut Self) -> Result<(), efi::Status> {
+        let interface = ProtocolPtr::from_raw(ctx.cast()).ok_or(efi::Status::INVALID_PARAMETER)?;
+        if let Err(error) = services.protocols.uninstall_interface(
+            controller,
+            protocols::simple_text_input::PROTOCOL_GUID.into(),
+            interface,
+        ) {
+            log::error!("Failed to uninstall simple_text_in interface: {:?}", error);
+            // The protocol is still installed, so the context stays allocated. The caller must not free the handler.
+            return Err(to_status(error));
+        }
 
-        let ctx = match boot_services.uninstall_protocol_interface(controller, key) {
-            Ok(ctx) => ctx,
-            Err(status) => {
-                log::error!("Failed to uninstall simple_text_in interface, status: {:x?}", status);
-                // Protocol is still installed. Null keyboard_handler so callbacks don't access a
-                // dropped KeyboardHidHandler.
-                // SAFETY: raw_ptr was saved from the protocol key before uninstall was attempted;
-                // since uninstall failed the protocol is still installed and the memory is valid.
-                unsafe {
-                    if let Some(ctx) = raw_ptr.as_mut() {
-                        ctx.keyboard_handler = ptr::null_mut();
-                    }
-                }
-                return Err(status);
-            }
-        };
+        // SAFETY: ctx was created via Box::into_raw in install and is no longer published.
+        let ctx = unsafe { Box::from_raw(ctx) };
 
-        if let Err(status) = boot_services.close_event(ctx.simple_text_in.wait_for_key) {
-            log::error!("Failed to close simple_text_in.wait_for_key event, status: {:x?}", status);
-            // Leak ctx so the still-live event callback doesn't use freed memory.
+        if let Some(event) = Event::from_raw(ctx.simple_text_in.wait_for_key)
+            && let Err(error) = services.events.close_event(event)
+        {
+            log::error!("Failed to close simple_text_in.wait_for_key event: {:?}", error);
+            // Leak ctx so a still-live event callback doesn't use freed memory.
             core::mem::forget(ctx);
-            return Err(status);
+            return Err(to_status(error));
         }
 
         // ctx drops here, freeing the SimpleTextInFfi allocation.
@@ -130,11 +108,11 @@ impl<T: BootServices + Clone + 'static> SimpleTextInFfi<T> {
     ) -> efi::Status {
         // SAFETY: `this` points to the first field of Self (#[repr(C)]), so the cast recovers
         // the full SimpleTextInFfi context. Null is handled by the check below.
-        let context = unsafe { (this as *mut Self).as_mut() };
+        let context = unsafe { (this as *const Self).as_ref() };
         let Some(context) = context else { return efi::Status::INVALID_PARAMETER };
-        // SAFETY: keyboard_handler pointer validity is ensured by the protocol lifecycle;
-        // null is handled by the check below.
-        let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
+        // SAFETY: the handler outlives the installed protocol (it is leaked if uninstall fails) and is only
+        // accessed through shared references; null is handled by the check below.
+        let keyboard_handler = unsafe { context.keyboard_handler.as_ref() };
         let Some(keyboard_handler) = keyboard_handler else {
             log::error!("simple_text_in_reset invoked after keyboard dropped.");
             return efi::Status::DEVICE_ERROR;
@@ -154,18 +132,19 @@ impl<T: BootServices + Clone + 'static> SimpleTextInFfi<T> {
         }
         // SAFETY: `this` points to the first field of Self (#[repr(C)]), so the cast recovers
         // the full SimpleTextInFfi context. Null is checked by the preceding guard.
-        let Some(context) = (unsafe { (this as *mut Self).as_mut() }) else {
+        let Some(context) = (unsafe { (this as *const Self).as_ref() }) else {
             return efi::Status::INVALID_PARAMETER;
         };
-        // SAFETY: keyboard_handler pointer validity is ensured by the protocol lifecycle;
-        // null is handled by the check below.
-        let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
+        // SAFETY: the handler outlives the installed protocol (it is leaked if uninstall fails) and is only
+        // accessed through shared references; null is handled by the check below.
+        let keyboard_handler = unsafe { context.keyboard_handler.as_ref() };
         let Some(keyboard_handler) = keyboard_handler else {
             log::error!("simple_text_in_read_key_stroke invoked after keyboard dropped.");
             return efi::Status::DEVICE_ERROR;
         };
 
-        let mut kq = keyboard_handler.state.lock();
+        let mut state = keyboard_handler.state.lock();
+        let kq = &mut state.key_queue;
         loop {
             if let Some(mut key_data) = kq.pop_key() {
                 // skip partials
@@ -201,25 +180,24 @@ impl<T: BootServices + Clone + 'static> SimpleTextInFfi<T> {
         }
     }
 
-    // Handles the wait_for_key event — part of the simple_text_in protocol interface.
-    extern "efiapi" fn simple_text_in_wait_for_key(event: efi::Event, context: *mut Self) {
-        // SAFETY: context pointer was provided by the UEFI event system from Box::into_raw;
-        // null is handled by the else branch below.
-        let Some(context) = (unsafe { context.as_mut() }) else {
-            log::error!("simple_text_in_wait_for_key invoked with invalid context");
-            return;
-        };
-        // SAFETY: keyboard_handler pointer validity is ensured by the protocol lifecycle;
-        // null is handled by the check below.
-        let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
+    /// Signals `event` if a (non-partial) key is available, discarding any leading partial keys.
+    ///
+    /// This is the notify logic for the wait_for_key event.
+    // TODO: invoke from the wait_for_key NOTIFY_WAIT notify function once Patina EventServices supports it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn signal_if_key_available(&self, event: Event) {
+        // SAFETY: the handler outlives the installed protocol (it is leaked if uninstall fails) and is only
+        // accessed through shared references; null is handled by the check below.
+        let keyboard_handler = unsafe { self.keyboard_handler.as_ref() };
         let Some(keyboard_handler) = keyboard_handler else { return };
-        let mut kq = keyboard_handler.state.lock();
+        let mut state = keyboard_handler.state.lock();
+        let kq = &mut state.key_queue;
         while let Some(key_data) = kq.peek_key() {
             if key_data.key.unicode_char == 0 && key_data.key.scan_code == 0 {
                 let _ = kq.pop_key();
                 continue;
             } else {
-                let _ = context.boot_services.signal_event(event);
+                let _ = self.services.events.signal_event(event);
                 break;
             }
         }
@@ -227,166 +205,156 @@ impl<T: BootServices + Clone + 'static> SimpleTextInFfi<T> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use core::ptr;
 
     use alloc::boxed::Box;
     use r_efi::{efi, protocols};
 
-    use patina::boot_services::{
-        MockBootServices,
-        c_ptr::{CPtr, PtrMetadata},
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use patina::{
+        component::service::uefi_services::{event::EventError, protocol::ProtocolError},
+        error::EfiError,
     };
 
     use super::*;
+    use crate::test_stubs::{mock_services, test_event, test_handle};
 
-    fn mock_boot_services() -> &'static mut MockBootServices {
-        let mut mock = MockBootServices::new();
-        mock.expect_raise_tpl().returning(|_| patina::boot_services::tpl::Tpl::APPLICATION);
-        mock.expect_restore_tpl().returning(|_| ());
-        // SAFETY: Leaked to obtain 'static lifetime for test use; never freed.
-        unsafe { Box::into_raw(Box::new(mock)).as_mut().unwrap() }
+    fn mock_boot_services() -> HidServices {
+        mock_services(|_, _, _| {})
     }
 
-    type StiPtr = SimpleTextInFfi<MockBootServices>;
-
-    fn test_context(
-        boot_services: &'static MockBootServices,
-        handler: &mut KeyboardHidHandler<MockBootServices>,
-    ) -> SimpleTextInFfi<MockBootServices> {
+    fn test_context(boot_services: HidServices, handler: &mut KeyboardHidHandler) -> SimpleTextInFfi {
         SimpleTextInFfi {
             simple_text_in: protocols::simple_text_input::Protocol {
-                reset: SimpleTextInFfi::<MockBootServices>::simple_text_in_reset,
-                read_key_stroke: SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke,
+                reset: SimpleTextInFfi::simple_text_in_reset,
+                read_key_stroke: SimpleTextInFfi::simple_text_in_read_key_stroke,
                 wait_for_key: ptr::null_mut(),
             },
-            boot_services,
-            keyboard_handler: handler as *mut KeyboardHidHandler<MockBootServices>,
+            services: boot_services,
+            keyboard_handler: handler as *mut KeyboardHidHandler,
         }
     }
 
-    fn leaked_context_key(
-        boot_services: &'static MockBootServices,
-        handler: &mut KeyboardHidHandler<MockBootServices>,
-    ) -> PtrMetadata<'static, Box<StiPtr>> {
-        let ctx = Box::new(SimpleTextInFfi {
+    pub(crate) fn leaked_context(services: HidServices, handler: &mut KeyboardHidHandler) -> *mut SimpleTextInFfi {
+        Box::into_raw(Box::new(SimpleTextInFfi {
             simple_text_in: protocols::simple_text_input::Protocol {
-                reset: SimpleTextInFfi::<MockBootServices>::simple_text_in_reset,
-                read_key_stroke: SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke,
-                wait_for_key: 0x42 as efi::Event,
+                reset: SimpleTextInFfi::simple_text_in_reset,
+                read_key_stroke: SimpleTextInFfi::simple_text_in_read_key_stroke,
+                wait_for_key: test_event(0x42).as_raw(),
             },
-            boot_services,
+            services,
             keyboard_handler: handler as *mut _,
-        });
-        let key = ctx.metadata();
-        let _ = Box::into_raw(ctx);
-        key
+        }))
     }
 
     // --- install/uninstall ---
 
     #[test]
-    fn install_succeeds() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_create_event::<*mut StiPtr>().times(1).returning(|_, _, _, _| Ok(0x42 as efi::Event));
-        boot_services.expect_install_protocol_interface::<StiPtr, Box<StiPtr>>().times(1).returning(
-            |_, protocol_interface| {
-                let key = protocol_interface.metadata();
-                let _ = Box::into_raw(protocol_interface);
-                Ok((0x1 as efi::Handle, key))
-            },
-        );
+    fn install_succeeds_with_unarmed_wait_event() {
+        let services = mock_services(|protocols, _, timers| {
+            timers.expect_create_timer_event_no_notify().returning(|| Ok(test_event(0x42)));
+            // The placeholder wait event must never be armed.
+            timers.expect_set_timer().never();
+            protocols.expect_install_interface().returning(|handle, guid, interface| {
+                assert_eq!(handle, Some(test_handle(0x2)));
+                assert_eq!(guid, protocols::simple_text_input::PROTOCOL_GUID);
+                // SAFETY: interface is the SimpleTextInFfi context created by install.
+                let ctx = unsafe { &*(interface.as_raw() as *const SimpleTextInFfi) };
+                assert_eq!(ctx.simple_text_in.wait_for_key, test_event(0x42).as_raw());
+                Ok(test_handle(0x2))
+            });
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let result = SimpleTextInFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
-        assert!(result.is_ok());
+        let handler = KeyboardHidHandler::new_for_test(services);
+        let ctx = SimpleTextInFfi::install(services, test_handle(0x2), &handler).unwrap();
 
-        let key = result.unwrap();
-        // SAFETY: Reclaiming the Box leaked by the mock install_protocol_interface.
-        drop(unsafe { Box::from_raw(key.ptr_value as *mut StiPtr) });
+        // SAFETY: Reclaiming the Box leaked by install.
+        drop(unsafe { Box::from_raw(ctx) });
     }
 
     #[test]
     fn install_returns_error_on_create_event_failure() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_create_event::<*mut StiPtr>()
-            .times(1)
-            .returning(|_, _, _, _| Err(efi::Status::OUT_OF_RESOURCES));
-        boot_services.expect_install_protocol_interface::<StiPtr, Box<StiPtr>>().never();
+        let services = mock_services(|protocols, _, timers| {
+            timers.expect_create_timer_event_no_notify().returning(|| Err(EventError::Internal));
+            protocols.expect_install_interface().never();
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let result = SimpleTextInFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
-        assert_eq!(result.err(), Some(efi::Status::OUT_OF_RESOURCES));
+        let handler = KeyboardHidHandler::new_for_test(services);
+        let result = SimpleTextInFfi::install(services, test_handle(0x2), &handler);
+        assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
     }
 
     #[test]
     fn install_cleans_up_event_on_install_protocol_failure() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_create_event::<*mut StiPtr>().times(1).returning(|_, _, _, _| Ok(0x42 as efi::Event));
-        boot_services
-            .expect_install_protocol_interface::<StiPtr, Box<StiPtr>>()
-            .times(1)
-            .returning(|_, _| Err(efi::Status::ACCESS_DENIED));
-        boot_services.expect_close_event().times(1).returning(|_| Ok(()));
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_install_interface().returning(|_, _, _| Err(ProtocolError::AccessDenied));
+            events.expect_close_event().returning(|_| {
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let result = SimpleTextInFfi::install(boot_services, 0x2 as efi::Handle, &mut handler);
+        let handler = KeyboardHidHandler::new_for_test(services);
+        let result = SimpleTextInFfi::install(services, test_handle(0x2), &handler);
         assert_eq!(result.err(), Some(efi::Status::ACCESS_DENIED));
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn uninstall_succeeds() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_uninstall_protocol_interface::<StiPtr, Box<StiPtr>>()
-            .times(1)
-            // SAFETY: Reclaiming the Box from the key, mirroring the real uninstall_protocol_interface.
-            .returning(|_, key| Ok(unsafe { Box::from_raw(key.ptr_value as *mut StiPtr) }));
-        boot_services.expect_close_event().times(1).returning(|_| Ok(()));
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_uninstall_interface().returning(|handle, guid, _| {
+                assert_eq!(handle, test_handle(0x2));
+                assert_eq!(guid, protocols::simple_text_input::PROTOCOL_GUID);
+                Ok(())
+            });
+            events.expect_close_event().returning(|event| {
+                assert_eq!(event, test_event(0x42));
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
-        let result = SimpleTextInFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
-        assert_eq!(result, Ok(()));
+        let mut handler = KeyboardHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &mut handler);
+        assert_eq!(SimpleTextInFfi::uninstall(services, test_handle(0x2), ctx), Ok(()));
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn uninstall_failure_nulls_keyboard_handler() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_uninstall_protocol_interface::<StiPtr, Box<StiPtr>>()
-            .times(1)
-            .returning(|_, _| Err(efi::Status::ACCESS_DENIED));
+    fn uninstall_failure_keeps_context() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_uninstall_interface().returning(|_, _, _| Err(ProtocolError::AccessDenied));
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
-        let raw_ptr = key.ptr_value as *mut StiPtr;
+        let mut handler = KeyboardHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &mut handler);
 
-        let result = SimpleTextInFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
+        let result = SimpleTextInFfi::uninstall(services, test_handle(0x2), ctx);
         assert_eq!(result, Err(efi::Status::ACCESS_DENIED));
 
-        // SAFETY: raw_ptr points to the still-live leaked context (uninstall failed).
-        let ctx = unsafe { raw_ptr.as_ref() }.unwrap();
-        assert!(ctx.keyboard_handler.is_null());
+        // The context is still installed and still references the handler, which the caller must therefore leak.
+        // SAFETY: ctx points to the still-live leaked context (uninstall failed).
+        assert_eq!(unsafe { &*ctx }.keyboard_handler, &raw const handler);
 
         // SAFETY: Reclaiming the leaked context Box for cleanup.
-        drop(unsafe { Box::from_raw(raw_ptr) });
+        drop(unsafe { Box::from_raw(ctx) });
     }
 
     #[test]
     fn uninstall_returns_error_on_close_event_failure() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_uninstall_protocol_interface::<StiPtr, Box<StiPtr>>()
-            .times(1)
-            // SAFETY: Reclaiming the Box from the key, mirroring the real uninstall_protocol_interface.
-            .returning(|_, key| Ok(unsafe { Box::from_raw(key.ptr_value as *mut StiPtr) }));
-        boot_services.expect_close_event().times(1).returning(|_| Err(efi::Status::INVALID_PARAMETER));
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            events.expect_close_event().returning(|_| Err(EfiError::InvalidParameter.into()));
+        });
 
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
-        let key = leaked_context_key(boot_services, &mut handler);
-        let result = SimpleTextInFfi::uninstall(boot_services, 0x2 as efi::Handle, key);
+        let mut handler = KeyboardHidHandler::new_for_test(services);
+        let ctx = leaked_context(services, &mut handler);
+        let result = SimpleTextInFfi::uninstall(services, test_handle(0x2), ctx);
         assert_eq!(result, Err(efi::Status::INVALID_PARAMETER));
     }
 
@@ -394,7 +362,7 @@ mod test {
 
     #[test]
     fn reset_returns_invalid_parameter_on_null() {
-        let status = SimpleTextInFfi::<MockBootServices>::simple_text_in_reset(ptr::null_mut(), false.into());
+        let status = SimpleTextInFfi::simple_text_in_reset(ptr::null_mut(), false.into());
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
     }
 
@@ -403,15 +371,14 @@ mod test {
         let boot_services = mock_boot_services();
         let mut ctx = SimpleTextInFfi {
             simple_text_in: protocols::simple_text_input::Protocol {
-                reset: SimpleTextInFfi::<MockBootServices>::simple_text_in_reset,
-                read_key_stroke: SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke,
+                reset: SimpleTextInFfi::simple_text_in_reset,
+                read_key_stroke: SimpleTextInFfi::simple_text_in_read_key_stroke,
                 wait_for_key: ptr::null_mut(),
             },
-            boot_services,
+            services: boot_services,
             keyboard_handler: ptr::null_mut(),
         };
-        let status =
-            SimpleTextInFfi::<MockBootServices>::simple_text_in_reset(&mut ctx.simple_text_in as *mut _, false.into());
+        let status = SimpleTextInFfi::simple_text_in_reset(&mut ctx.simple_text_in as *mut _, false.into());
         assert_eq!(status, efi::Status::DEVICE_ERROR);
     }
 
@@ -421,25 +388,14 @@ mod test {
         let mut handler = KeyboardHidHandler::new_for_test(boot_services);
         let mut ctx = test_context(boot_services, &mut handler);
         let mut key = protocols::simple_text_input::InputKey::default();
-        let status = SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke(
-            &mut ctx.simple_text_in as *mut _,
-            &mut key,
-        );
+        let status = SimpleTextInFfi::simple_text_in_read_key_stroke(&mut ctx.simple_text_in as *mut _, &mut key);
         assert_eq!(status, efi::Status::NOT_READY);
     }
 
     #[test]
     fn read_key_stroke_returns_invalid_parameter_on_null() {
-        let status =
-            SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke(ptr::null_mut(), ptr::null_mut());
+        let status = SimpleTextInFfi::simple_text_in_read_key_stroke(ptr::null_mut(), ptr::null_mut());
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-    }
-
-    #[test]
-    fn wait_for_key_handles_null_context() {
-        let event = 0x1234 as efi::Event;
-        // Should log an error but not panic.
-        SimpleTextInFfi::<MockBootServices>::simple_text_in_wait_for_key(event, ptr::null_mut());
     }
 
     #[test]
@@ -447,8 +403,7 @@ mod test {
         let boot_services = mock_boot_services();
         let mut handler = KeyboardHidHandler::new_for_test(boot_services);
         let mut ctx = test_context(boot_services, &mut handler);
-        let status =
-            SimpleTextInFfi::<MockBootServices>::simple_text_in_reset(&mut ctx.simple_text_in as *mut _, false.into());
+        let status = SimpleTextInFfi::simple_text_in_reset(&mut ctx.simple_text_in as *mut _, false.into());
         assert_eq!(status, efi::Status::SUCCESS);
     }
 
@@ -460,17 +415,15 @@ mod test {
         let mut handler = KeyboardHidHandler::new_for_test(boot_services);
 
         {
-            let mut kq = handler.state.lock();
+            let mut state = handler.state.lock();
+            let kq = &mut state.key_queue;
             kq.set_layout(Some(crate::keyboard::layout::get_default_keyboard_layout()));
             kq.keystroke(Usage::from(0x00070028u32), super::super::key_queue::KeyAction::KeyDown);
         }
 
         let mut ctx = test_context(boot_services, &mut handler);
         let mut key = protocols::simple_text_input::InputKey::default();
-        let status = SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke(
-            &mut ctx.simple_text_in as *mut _,
-            &mut key,
-        );
+        let status = SimpleTextInFfi::simple_text_in_read_key_stroke(&mut ctx.simple_text_in as *mut _, &mut key);
         assert_eq!(status, efi::Status::SUCCESS);
         assert!(key.scan_code != 0 || key.unicode_char != 0);
     }
@@ -480,18 +433,15 @@ mod test {
         let boot_services = mock_boot_services();
         let mut ctx = SimpleTextInFfi {
             simple_text_in: protocols::simple_text_input::Protocol {
-                reset: SimpleTextInFfi::<MockBootServices>::simple_text_in_reset,
-                read_key_stroke: SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke,
+                reset: SimpleTextInFfi::simple_text_in_reset,
+                read_key_stroke: SimpleTextInFfi::simple_text_in_read_key_stroke,
                 wait_for_key: ptr::null_mut(),
             },
-            boot_services,
+            services: boot_services,
             keyboard_handler: ptr::null_mut(),
         };
         let mut key = protocols::simple_text_input::InputKey::default();
-        let status = SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke(
-            &mut ctx.simple_text_in as *mut _,
-            &mut key,
-        );
+        let status = SimpleTextInFfi::simple_text_in_read_key_stroke(&mut ctx.simple_text_in as *mut _, &mut key);
         assert_eq!(status, efi::Status::DEVICE_ERROR);
     }
 
@@ -503,7 +453,8 @@ mod test {
         let mut handler = KeyboardHidHandler::new_for_test(boot_services);
 
         {
-            let mut kq = handler.state.lock();
+            let mut state = handler.state.lock();
+            let kq = &mut state.key_queue;
             kq.set_layout(Some(crate::keyboard::layout::get_default_keyboard_layout()));
             // Enable partial key support so modifier keys are enqueued.
             kq.set_key_toggle_state(
@@ -518,45 +469,62 @@ mod test {
 
         let mut ctx = test_context(boot_services, &mut handler);
         let mut key = protocols::simple_text_input::InputKey::default();
-        let status = SimpleTextInFfi::<MockBootServices>::simple_text_in_read_key_stroke(
-            &mut ctx.simple_text_in as *mut _,
-            &mut key,
-        );
+        let status = SimpleTextInFfi::simple_text_in_read_key_stroke(&mut ctx.simple_text_in as *mut _, &mut key);
         assert_eq!(status, efi::Status::SUCCESS);
         assert!(key.scan_code != 0 || key.unicode_char != 0);
     }
 
+    fn counting_signal_services(signals: &'static AtomicUsize) -> HidServices {
+        mock_services(move |_, events, _| {
+            events.expect_signal_event().returning(move |event| {
+                assert_eq!(event, test_event(0x1234));
+                signals.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        })
+    }
+
     #[test]
-    fn wait_for_key_signals_event_when_key_available() {
+    fn signal_if_key_available_signals_event_when_key_available() {
         use hidparser::report_data_types::Usage;
 
-        let boot_services = mock_boot_services();
-        boot_services.expect_signal_event().times(1).returning(|_| Ok(()));
-
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        let services = counting_signal_services(&SIGNALS);
+        let mut handler = KeyboardHidHandler::new_for_test(services);
 
         {
-            let mut kq = handler.state.lock();
+            let mut state = handler.state.lock();
+            let kq = &mut state.key_queue;
             kq.set_layout(Some(crate::keyboard::layout::get_default_keyboard_layout()));
             kq.keystroke(Usage::from(0x00070028u32), super::super::key_queue::KeyAction::KeyDown);
         }
 
-        let mut ctx = test_context(boot_services, &mut handler);
-        let event = 0x1234 as efi::Event;
-        SimpleTextInFfi::<MockBootServices>::simple_text_in_wait_for_key(event, &mut ctx as *mut _);
+        let ctx = test_context(services, &mut handler);
+        ctx.signal_if_key_available(test_event(0x1234));
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn wait_for_key_skips_partial_and_signals_for_real_key() {
+    fn signal_if_key_available_does_not_signal_on_empty_queue() {
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        let services = counting_signal_services(&SIGNALS);
+        let mut handler = KeyboardHidHandler::new_for_test(services);
+        let ctx = test_context(services, &mut handler);
+        ctx.signal_if_key_available(test_event(0x1234));
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn signal_if_key_available_skips_partial_and_signals_for_real_key() {
         use hidparser::report_data_types::Usage;
 
-        let boot_services = mock_boot_services();
-        boot_services.expect_signal_event().times(1).returning(|_| Ok(()));
-
-        let mut handler = KeyboardHidHandler::new_for_test(boot_services);
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        let services = counting_signal_services(&SIGNALS);
+        let mut handler = KeyboardHidHandler::new_for_test(services);
 
         {
-            let mut kq = handler.state.lock();
+            let mut state = handler.state.lock();
+            let kq = &mut state.key_queue;
             kq.set_layout(Some(crate::keyboard::layout::get_default_keyboard_layout()));
             // Enable partial key support so modifier keys are enqueued.
             kq.set_key_toggle_state(
@@ -569,8 +537,8 @@ mod test {
             kq.keystroke(Usage::from(0x00070028u32), super::super::key_queue::KeyAction::KeyDown);
         }
 
-        let mut ctx = test_context(boot_services, &mut handler);
-        let event = 0x1234 as efi::Event;
-        SimpleTextInFfi::<MockBootServices>::simple_text_in_wait_for_key(event, &mut ctx as *mut _);
+        let ctx = test_context(services, &mut handler);
+        ctx.signal_if_key_available(test_event(0x1234));
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
     }
 }

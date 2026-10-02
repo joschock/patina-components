@@ -21,7 +21,10 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::ptr;
+use core::{
+    ptr::{self, NonNull},
+    time::Duration,
+};
 
 use r_efi::{efi, protocols};
 
@@ -31,16 +34,23 @@ use hidparser::{
 };
 
 use patina::{
-    boot_services::{
-        BootServices,
-        c_ptr::PtrMetadata,
-        event::{EventTimerType, EventType},
-        tpl::Tpl,
+    component::service::{
+        Service,
+        uefi_services::{
+            event::{Event, EventServicesExt, Tpl as ServiceTpl},
+            handle::Handle,
+            timer_event::{TimerEventServicesExt, TimerType},
+            tpl::TplServices,
+        },
     },
-    tpl_mutex::TplMutex,
+    uefi::{boot_services::tpl::Tpl, tpl_mutex::TplMutex},
 };
 
-use crate::hid_io::{HidIo, HidReportReceiver};
+use crate::{
+    HidServices,
+    hid_io::{HidIo, HidReportReceiver},
+    to_status,
+};
 
 #[cfg(feature = "ctrl-alt-del")]
 use r_efi::protocols::simple_text_input_ex::{
@@ -49,10 +59,10 @@ use r_efi::protocols::simple_text_input_ex::{
 
 use self::key_queue::OrdKeyData;
 
-// Repeat key delay: 500ms in 100ns units.
-const REPEAT_KEY_DELAY: u64 = 5_000_000;
-// Repeat key rate: 20ms in 100ns units (~50 keys/sec).
-const REPEAT_KEY_RATE: u64 = 200_000;
+// Repeat key delay.
+const REPEAT_KEY_DELAY: Duration = Duration::from_millis(500);
+// Repeat key rate (~50 keys/sec).
+const REPEAT_KEY_RATE: Duration = Duration::from_millis(20);
 
 // usages supported by this module
 const KEYBOARD_MODIFIER_USAGE_MIN: u32 = 0x000700E0;
@@ -109,6 +119,8 @@ struct KeyboardProcessor {
     led_state: BTreeSet<Usage>,
     notification_callbacks: BTreeMap<usize, (OrdKeyData, protocols::simple_text_input_ex::KeyNotifyFunction)>,
     next_notify_handle: usize,
+    // Key currently being auto-repeated by the repeat timer, if any.
+    repeat_key: Option<Usage>,
 }
 
 impl KeyboardProcessor {
@@ -123,6 +135,7 @@ impl KeyboardProcessor {
             led_state: BTreeSet::new(),
             notification_callbacks: BTreeMap::new(),
             next_notify_handle: 0,
+            repeat_key: None,
         }
     }
 
@@ -222,6 +235,7 @@ impl KeyboardProcessor {
     fn reset(&mut self, kq: &mut key_queue::KeyQueue, extended_verification: bool) {
         self.last_keys.clear();
         self.current_keys.clear();
+        self.repeat_key = None;
         kq.reset(extended_verification);
         if extended_verification {
             self.led_state.clear();
@@ -388,221 +402,191 @@ impl KeyboardProcessor {
     }
 }
 
-// Context passed to the keyboard layout change event callback.
-pub(crate) struct LayoutChangeContext<T: BootServices + Clone + 'static> {
-    boot_services: &'static T,
-    keyboard_handler: *mut KeyboardHidHandler<T>,
+// Mutable keyboard state. Report delivery, protocol entry points, and event callbacks all reach it through the
+// handler's single `state` lock.
+pub(crate) struct KeyboardState {
+    processor: KeyboardProcessor,
+    pub(crate) key_queue: key_queue::KeyQueue,
+    simple_text_in: *mut simple_text_in::SimpleTextInFfi,
+    simple_text_in_ex: *mut simple_text_in_ex::SimpleTextInExFfi,
+    key_notify_event: Option<Event>,
+    layout_change_event: Option<Event>,
+    repeat_timer_event: Option<Event>,
 }
 
-// Context passed to the key repeat timer event callback.
-#[repr(C)]
-struct RepeatTimerContext<T: BootServices + Clone + 'static> {
-    keyboard_handler: *mut KeyboardHidHandler<T>,
+impl KeyboardState {
+    fn new(processor: KeyboardProcessor) -> Self {
+        Self {
+            processor,
+            key_queue: key_queue::KeyQueue::default(),
+            simple_text_in: ptr::null_mut(),
+            simple_text_in_ex: ptr::null_mut(),
+            key_notify_event: None,
+            layout_change_event: None,
+            repeat_timer_event: None,
+        }
+    }
 }
 
 /// Keyboard HID handler that processes reports and produces UEFI SimpleTextIn keystrokes.
-pub struct KeyboardHidHandler<T: BootServices + Clone + 'static> {
-    boot_services: &'static T,
-    controller: efi::Handle,
+///
+/// Once leaked by [`KeyboardReceiver::new`], the handler is only ever accessed through shared references: event
+/// callbacks, protocol entry points, and report delivery can preempt one another at different TPLs, so none of them
+/// may hold `&mut`. All mutable state lives behind one `TplMutex` locked at TPL_NOTIFY, the highest TPL of any
+/// callback here.
+///
+/// The lock is not re-entrant, so it must not be held across calls that can re-enter the handler or that require a
+/// lower TPL: protocol uninstall, HII database calls, device I/O, and key notify functions.
+pub struct KeyboardHidHandler {
+    services: HidServices,
+    controller: Option<Handle>,
     hid_io: Option<*const dyn HidIo>,
-    simple_text_in_key: Option<PtrMetadata<'static, Box<simple_text_in::SimpleTextInFfi<T>>>>,
-    simple_text_in_ex_key: Option<PtrMetadata<'static, Box<simple_text_in_ex::SimpleTextInExFfi<T>>>>,
-    processor: KeyboardProcessor,
-    pub(crate) state: TplMutex<key_queue::KeyQueue, T>,
-    pub(crate) key_notify_event: efi::Event,
-    layout_change_event: efi::Event,
-    layout_context: *mut LayoutChangeContext<T>,
-    repeat_timer_event: efi::Event,
-    repeat_context: *mut RepeatTimerContext<T>,
-    pub(crate) repeat_key: Option<Usage>,
+    pub(crate) state: TplMutex<KeyboardState, Service<dyn TplServices>>,
+    // Root pointer to this handler, written once at allocation in `KeyboardReceiver::new`. Protocol contexts and
+    // event closures store copies of it, so they share its provenance. Invariant: when `Some`, it points to this same
+    // leaked handler, which is not freed while any event or protocol holding a copy is still installed.
+    root: Option<NonNull<KeyboardHidHandler>>,
 }
 
-impl<T: BootServices + Clone + 'static> KeyboardHidHandler<T> {
-    /// Creates a fully initialized Keyboard HID handler for the given controller.
-    ///
-    /// Returns a boxed handler because protocol installation stores raw pointers to `self`.
-    /// Boxing first ensures those pointers remain valid (the handler is never moved after boxing).
-    pub fn new(
-        boot_services: &'static T,
-        controller: efi::Handle,
-        hid_io: &dyn HidIo,
-    ) -> Result<Box<Self>, efi::Status> {
-        let mut processor = KeyboardProcessor::new();
-        let descriptor = hid_io.get_report_descriptor()?;
-        processor.process_descriptor(descriptor)?;
-
-        let mut handler = Box::new(Self {
-            boot_services,
-            controller,
-            // SAFETY: hid_io is valid for the device lifetime (backed by a BY_DRIVER protocol
-            // reference in UefiHidIo). Transmute erases the borrow lifetime for raw pointer storage.
-            hid_io: Some(unsafe {
-                core::mem::transmute::<*const dyn HidIo, *const dyn HidIo>(hid_io as *const dyn HidIo)
-            }),
-            simple_text_in_key: None,
-            simple_text_in_ex_key: None,
-            processor,
-            state: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, key_queue::KeyQueue::default()),
-            key_notify_event: core::ptr::null_mut(),
-            layout_change_event: core::ptr::null_mut(),
-            layout_context: core::ptr::null_mut(),
-            repeat_timer_event: core::ptr::null_mut(),
-            repeat_context: core::ptr::null_mut(),
-            repeat_key: None,
-        });
-
-        handler.reset(true);
-        handler.install_protocol_interfaces()?;
-        handler.initialize_keyboard_layout()?;
-        handler.install_repeat_timer()?;
-
-        // Register Ctrl-Alt-Delete handler to reset the system. Register only for DEL scan code;
-        // CTRL-ALT shift state is validated in the callback to handle any left/right combination.
-        #[cfg(feature = "ctrl-alt-del")]
-        {
-            let reset_key_data = protocols::simple_text_input_ex::KeyData {
-                key: protocols::simple_text_input::InputKey { scan_code: key_queue::SCAN_DELETE, unicode_char: 0 },
-                key_state: protocols::simple_text_input_ex::KeyState { key_toggle_state: 0, key_shift_state: 0 },
-            };
-            handler.insert_key_notify_callback(reset_key_data, reset_notification_function);
-        }
-
-        Ok(handler)
+impl KeyboardHidHandler {
+    // Returns the root pointer for storage in protocol contexts and event closures.
+    fn root(&self) -> Result<NonNull<Self>, efi::Status> {
+        self.root.ok_or_else(|| {
+            log::error!("KeyboardHidHandler: root pointer not set; handler was not created by KeyboardReceiver::new");
+            efi::Status::NOT_READY
+        })
     }
 
-    // Installs SimpleTextIn and SimpleTextInEx protocol interfaces.
-    fn install_protocol_interfaces(&mut self) -> Result<(), efi::Status> {
-        let sti_key = simple_text_in::SimpleTextInFfi::install(self.boot_services, self.controller, self)?;
-        let sti_ex_key = match simple_text_in_ex::SimpleTextInExFfi::install(self.boot_services, self.controller, self)
-        {
-            Ok(key) => key,
-            Err(status) => {
-                let _ = simple_text_in::SimpleTextInFfi::<T>::uninstall(self.boot_services, self.controller, sti_key);
-                return Err(status);
-            }
-        };
-        self.simple_text_in_key = Some(sti_key);
-        self.simple_text_in_ex_key = Some(sti_ex_key);
+    // Installs SimpleTextIn and SimpleTextInEx protocol interfaces. Each is recorded as soon as it is installed, so
+    // a later failure leaves it for `teardown` to release.
+    fn install_protocol_interfaces(&self, controller: Handle) -> Result<(), efi::Status> {
+        let root = self.root()?.as_ptr().cast_const();
+        let sti = simple_text_in::SimpleTextInFfi::install(self.services, controller, root)?;
+        self.state.lock().simple_text_in = sti;
+        let (sti_ex, key_notify_event) =
+            simple_text_in_ex::SimpleTextInExFfi::install(self.services, controller, root)?;
+        let mut state = self.state.lock();
+        state.simple_text_in_ex = sti_ex;
+        state.key_notify_event = Some(key_notify_event);
         Ok(())
     }
 
-    // Creates and registers the keyboard layout change event.
-    fn install_layout_change_event(&mut self) -> Result<(), efi::Status> {
-        let context = LayoutChangeContext { boot_services: self.boot_services, keyboard_handler: self as *mut Self };
-        let context_ptr = Box::into_raw(Box::new(context));
-
-        // SAFETY: context_ptr is valid from Box::into_raw and will remain valid for the event lifetime.
-        let layout_change_event = unsafe {
-            self.boot_services.create_event_ex_unchecked(
-                EventType::NOTIFY_SIGNAL,
-                Tpl::NOTIFY,
-                Some(Self::on_layout_update),
-                context_ptr,
-                &protocols::hii_database::SET_KEYBOARD_LAYOUT_EVENT_GUID,
-            )
+    // Uninstalls the SimpleTextIn and SimpleTextInEx protocol interfaces. Attempts both, returning the first error.
+    // An interface that fails to uninstall stays recorded.
+    //
+    // Each interface is taken out of the state before uninstalling, since the lock cannot be held across the uninstall.
+    fn uninstall_protocol_interfaces(&self) -> Result<(), efi::Status> {
+        let Some(controller) = self.controller else {
+            return Ok(());
         };
-
-        match layout_change_event {
-            Ok(event) => {
-                self.layout_change_event = event;
-                self.layout_context = context_ptr;
-                Ok(())
-            }
-            Err(status) => {
-                // SAFETY: context_ptr was created via Box::into_raw above and is being reclaimed on the error path.
-                drop(unsafe { Box::from_raw(context_ptr) });
-                Err(status)
-            }
+        let mut result = Ok(());
+        let sti = core::mem::replace(&mut self.state.lock().simple_text_in, ptr::null_mut());
+        if !sti.is_null()
+            && let Err(status) = simple_text_in::SimpleTextInFfi::uninstall(self.services, controller, sti)
+        {
+            log::error!("Failed to uninstall simple_text_in: {:?}", status);
+            self.state.lock().simple_text_in = sti;
+            result = Err(status);
         }
+        // The key notify event's callback uses the context, so it is closed along with it.
+        let (sti_ex, key_notify_event) = {
+            let mut state = self.state.lock();
+            (core::mem::replace(&mut state.simple_text_in_ex, ptr::null_mut()), state.key_notify_event.take())
+        };
+        if !sti_ex.is_null()
+            && let Err(status) =
+                simple_text_in_ex::SimpleTextInExFfi::uninstall(self.services, controller, sti_ex, key_notify_event)
+        {
+            log::error!("Failed to uninstall simple_text_in_ex: {:?}", status);
+            let mut state = self.state.lock();
+            state.simple_text_in_ex = sti_ex;
+            state.key_notify_event = key_notify_event;
+            result = result.and(Err(status));
+        }
+        result
     }
 
-    // Closes the layout change event and frees its context.
-    fn uninstall_layout_change_event(&mut self) -> Result<(), efi::Status> {
-        if !self.layout_change_event.is_null() {
-            let layout_change_event = self.layout_change_event;
-            if let Err(status) = self.boot_services.close_event(layout_change_event) {
-                log::error!("Failed to close layout_change_event event, status: {:x?}", status);
-                // SAFETY: layout_context is valid while self exists; nulling the handler prevents stale callbacks.
-                unsafe {
-                    (*self.layout_context).keyboard_handler = ptr::null_mut();
-                }
-                return Err(status);
-            }
-            // SAFETY: layout_context was created via Box::into_raw during install_layout_change_event.
-            drop(unsafe { Box::from_raw(self.layout_context) });
-            self.layout_context = ptr::null_mut();
-            self.layout_change_event = ptr::null_mut();
+    // Creates and registers the keyboard layout change event.
+    fn install_layout_change_event(&self) -> Result<(), efi::Status> {
+        let root = self.root()?;
+        let event = self
+            .services
+            .events
+            .on_event_group(
+                protocols::hii_database::SET_KEYBOARD_LAYOUT_EVENT_GUID.into(),
+                ServiceTpl::Notify,
+                // SAFETY: by the `root` invariant, the handler outlives this event, and it is only accessed through
+                // shared references.
+                move || unsafe { root.as_ref() }.on_layout_update(),
+            )
+            .map_err(to_status)?;
+        self.state.lock().layout_change_event = Some(event);
+        Ok(())
+    }
+
+    // Closes the layout change event.
+    fn uninstall_layout_change_event(&self) -> Result<(), efi::Status> {
+        let Some(layout_change_event) = self.state.lock().layout_change_event.take() else { return Ok(()) };
+        if let Err(error) = self.services.events.close_event(layout_change_event) {
+            log::error!("Failed to close layout_change_event event: {:?}", error);
+            self.state.lock().layout_change_event = Some(layout_change_event);
+            return Err(to_status(error));
         }
         Ok(())
     }
 
     // Creates the repeat key timer event used for keystroke repeat when a key is held.
-    fn install_repeat_timer(&mut self) -> Result<(), efi::Status> {
-        let context = RepeatTimerContext { keyboard_handler: self as *mut Self };
-        let context_ptr = Box::into_raw(Box::new(context));
-
-        // SAFETY: context_ptr is valid from Box::into_raw and will remain valid for the event lifetime.
-        let repeat_timer = unsafe {
-            self.boot_services.create_event_unchecked(
-                EventType::TIMER | EventType::NOTIFY_SIGNAL,
-                Tpl::NOTIFY,
-                Some(Self::on_repeat_timer),
-                context_ptr,
+    fn install_repeat_timer(&self) -> Result<(), efi::Status> {
+        let root = self.root()?;
+        let event = self
+            .services
+            .timers
+            .on_timer_event(
+                ServiceTpl::Notify,
+                // SAFETY: as in `install_layout_change_event`.
+                move || unsafe { root.as_ref() }.on_repeat_timer(),
             )
-        };
-
-        match repeat_timer {
-            Ok(event) => {
-                self.repeat_timer_event = event;
-                self.repeat_context = context_ptr;
-                Ok(())
-            }
-            Err(status) => {
-                // SAFETY: context_ptr was created via Box::into_raw above and is being reclaimed on the error path.
-                drop(unsafe { Box::from_raw(context_ptr) });
-                Err(status)
-            }
-        }
+            .map_err(to_status)?;
+        self.state.lock().repeat_timer_event = Some(event);
+        Ok(())
     }
 
-    // Closes the repeat timer event and frees the context.
-    fn uninstall_repeat_timer(&mut self) -> Result<(), efi::Status> {
-        if !self.repeat_timer_event.is_null() {
-            self.repeat_key = None;
-            if let Err(status) = self.boot_services.set_timer(self.repeat_timer_event, EventTimerType::Cancel, 0) {
-                log::error!("Failed to cancel repeat_timer, status: {:x?}", status);
-                // SAFETY: repeat_context is valid while self exists; nulling the handler prevents stale callbacks.
-                unsafe {
-                    (*self.repeat_context).keyboard_handler = ptr::null_mut();
-                }
-                return Err(status);
+    // Cancels and closes the repeat timer event.
+    fn uninstall_repeat_timer(&self) -> Result<(), efi::Status> {
+        let repeat_timer_event = {
+            let mut state = self.state.lock();
+            state.processor.repeat_key = None;
+            state.repeat_timer_event
+        };
+        if let Some(repeat_timer_event) = repeat_timer_event {
+            if let Err(error) = self.services.timers.set_timer(repeat_timer_event, TimerType::Cancel) {
+                log::error!("Failed to cancel repeat_timer: {:?}", error);
+                return Err(to_status(error));
             }
-
-            if let Err(status) = self.boot_services.close_event(self.repeat_timer_event) {
-                log::error!("Failed to close repeat_timer event, status: {:x?}", status);
-                // SAFETY: repeat_context is valid while self exists; nulling the handler prevents stale callbacks.
-                unsafe {
-                    (*self.repeat_context).keyboard_handler = ptr::null_mut();
-                }
-                return Err(status);
+            if let Err(error) = self.services.events.close_event(repeat_timer_event) {
+                log::error!("Failed to close repeat_timer event: {:?}", error);
+                return Err(to_status(error));
             }
-            // SAFETY: repeat_context was created via Box::into_raw during install_repeat_timer.
-            drop(unsafe { Box::from_raw(self.repeat_context) });
-            self.repeat_context = ptr::null_mut();
-            self.repeat_timer_event = ptr::null_mut();
+            self.state.lock().repeat_timer_event = None;
         }
         Ok(())
     }
 
-    // Installs the default US keyboard layout via the HII database.
-    fn install_default_layout(&mut self) -> Result<(), efi::Status> {
-        // SAFETY: We locate the HII database protocol and call its methods per UEFI spec.
-        let hii_database_protocol_ptr = unsafe {
-            self.boot_services.locate_protocol_unchecked(&protocols::hii_database::PROTOCOL_GUID, ptr::null_mut())
-        };
+    // Locates the HII database protocol.
+    fn locate_hii_database(services: HidServices) -> Result<*mut protocols::hii_database::Protocol, efi::Status> {
+        services
+            .protocols
+            .locate_interface(protocols::hii_database::PROTOCOL_GUID.into())
+            .map(|ptr| ptr.as_raw() as *mut protocols::hii_database::Protocol)
+            .map_err(to_status)
+    }
 
-        let hii_database_protocol_ptr = match hii_database_protocol_ptr {
-            Ok(ptr) => ptr as *mut protocols::hii_database::Protocol,
+    // Installs the default US keyboard layout via the HII database.
+    //
+    // Takes no `self` borrow: setting the layout signals the layout change event, whose callback accesses the handler.
+    fn install_default_layout(services: HidServices) -> Result<(), efi::Status> {
+        let hii_database_protocol_ptr = match Self::locate_hii_database(services) {
+            Ok(ptr) => ptr,
             Err(status) => {
                 log::error!("keyboard::install_default_layout: Could not locate hii_database protocol: {:x?}", status);
                 return Err(status);
@@ -646,28 +630,22 @@ impl<T: BootServices + Clone + 'static> KeyboardHidHandler<T> {
         Ok(())
     }
 
-    // Initializes the keyboard layout from the HII database or installs a default.
-    fn initialize_keyboard_layout(&mut self) -> Result<(), efi::Status> {
+    // Registers for layout changes and picks up any layout already in the HII database. Returns whether a default
+    // layout still needs to be installed. That install signals the layout change event, so the caller must do it
+    // without holding a borrow of the handler (see `install_default_layout`).
+    fn initialize_keyboard_layout(&self) -> Result<bool, efi::Status> {
         log::trace!("initialize_keyboard_layout: setting up keyboard layout");
         self.install_layout_change_event()?;
 
-        // fake signal event to pick up any existing layout
-        Self::on_layout_update(self.layout_change_event, self.layout_context);
+        // Fake signal event to pick up any existing layout.
+        self.on_layout_update();
 
-        // install a default layout if no layout is installed.
-        // Note: the guard must be dropped before install_default_layout to avoid
-        // re-entrant TplMutex acquisition if a notification fires during installation.
-        let needs_default = self.state.lock().layout().is_none();
-        if needs_default {
-            log::trace!("initialize_keyboard_layout: no existing layout found, installing default");
-            self.install_default_layout()?;
-        }
-        Ok(())
+        Ok(self.state.lock().key_queue.layout().is_none())
     }
 
     // Sends HID output reports to the device.
     pub(crate) fn send_output_reports(
-        &mut self,
+        &self,
         hid_io: &dyn HidIo,
         output_reports: Vec<(Option<ReportId>, Vec<u8>)>,
     ) -> Result<(), efi::Status> {
@@ -685,182 +663,144 @@ impl<T: BootServices + Clone + 'static> KeyboardHidHandler<T> {
     }
 
     /// Resets the keyboard driver state.
-    pub fn reset(&mut self, extended_verification: bool) {
-        let mut kq = self.state.lock();
-        self.processor.reset(&mut kq, extended_verification);
-        // Cancel any active repeat timer.
-        self.repeat_key = None;
-        if !self.repeat_timer_event.is_null()
-            && let Err(status) = self.boot_services.set_timer(self.repeat_timer_event, EventTimerType::Cancel, 0)
+    pub fn reset(&self, extended_verification: bool) {
+        let state = &mut *self.state.lock();
+        state.processor.reset(&mut state.key_queue, extended_verification);
+        // Cancel any active repeat timer (processor reset cleared the repeat key).
+        if let Some(repeat_timer_event) = state.repeat_timer_event
+            && let Err(error) = self.services.timers.set_timer(repeat_timer_event, TimerType::Cancel)
         {
-            log::error!("Failed to cancel repeat_timer during reset, status: {:x?}", status);
+            log::error!("Failed to cancel repeat_timer during reset: {:?}", error);
         }
     }
 
     /// Returns a clone of the keystroke at the front of the keystroke queue.
     pub fn peek_key(&self) -> Option<protocols::simple_text_input_ex::KeyData> {
-        self.state.lock().peek_key()
+        self.state.lock().key_queue.peek_key()
     }
 
     /// Removes and returns the keystroke at the front of the keystroke queue.
     pub fn pop_key(&self) -> Option<protocols::simple_text_input_ex::KeyData> {
-        self.state.lock().pop_key()
+        self.state.lock().key_queue.pop_key()
     }
 
     /// Returns the current key state (i.e. the SHIFT and TOGGLE state).
     pub fn get_key_state(&self) -> protocols::simple_text_input_ex::KeyState {
-        self.state.lock().init_key_state()
+        self.state.lock().key_queue.init_key_state()
     }
 
     /// Sets the keyboard toggle state and sends updated LED reports to the device.
-    pub fn set_key_toggle_state(&mut self, toggle_state: u8) {
-        let current_leds: BTreeSet<Usage> = {
-            let mut kq = self.state.lock();
-            kq.set_key_toggle_state(toggle_state);
-            kq.active_leds().iter().cloned().collect()
+    pub fn set_key_toggle_state(&self, toggle_state: u8) {
+        let output_reports = {
+            let state = &mut *self.state.lock();
+            state.key_queue.set_key_toggle_state(toggle_state);
+            let current_leds: BTreeSet<Usage> = state.key_queue.active_leds().iter().cloned().collect();
+            if current_leds == state.processor.led_state {
+                return;
+            }
+            state.processor.led_state = current_leds;
+            state.processor.build_led_output_reports()
         };
-        if current_leds != self.processor.led_state {
-            self.processor.led_state = current_leds;
-            let output_reports = self.processor.build_led_output_reports();
-            if let Some(hid_io_ptr) = self.hid_io {
-                // SAFETY: hid_io is valid for the device lifetime, set during construction.
-                let hid_io = unsafe { &*hid_io_ptr };
-                if let Err(e) = self.send_output_reports(hid_io, output_reports) {
-                    log::error!("set_key_toggle_state: failed to send LED reports: {:?}", e);
-                }
+        if let Some(hid_io_ptr) = self.hid_io {
+            // SAFETY: hid_io is valid for the device lifetime, set during construction.
+            let hid_io = unsafe { &*hid_io_ptr };
+            if let Err(e) = self.send_output_reports(hid_io, output_reports) {
+                log::error!("set_key_toggle_state: failed to send LED reports: {:?}", e);
             }
         }
     }
 
     /// Registers a new key notify callback function.
     pub fn insert_key_notify_callback(
-        &mut self,
+        &self,
         key_data: protocols::simple_text_input_ex::KeyData,
         key_notification_function: protocols::simple_text_input_ex::KeyNotifyFunction,
     ) -> usize {
-        let mut kq = self.state.lock();
-        self.processor.insert_key_notify_callback(key_data, key_notification_function, &mut kq)
+        let state = &mut *self.state.lock();
+        state.processor.insert_key_notify_callback(key_data, key_notification_function, &mut state.key_queue)
     }
 
     /// Unregisters a previously registered key notify callback function.
-    pub fn remove_key_notify_callback(&mut self, notification_handle: usize) -> Result<(), efi::Status> {
-        let mut kq = self.state.lock();
-        self.processor.remove_key_notify_callback(notification_handle, &mut kq)
+    pub fn remove_key_notify_callback(&self, notification_handle: usize) -> Result<(), efi::Status> {
+        let state = &mut *self.state.lock();
+        state.processor.remove_key_notify_callback(notification_handle, &mut state.key_queue)
     }
 
     /// Returns the set of keys that have pending callbacks.
     pub fn pending_callbacks(
-        &mut self,
+        &self,
     ) -> (Option<protocols::simple_text_input_ex::KeyData>, Vec<protocols::simple_text_input_ex::KeyNotifyFunction>)
     {
-        let mut kq = self.state.lock();
-        self.processor.pending_callbacks(&mut kq)
+        let state = &mut *self.state.lock();
+        state.processor.pending_callbacks(&mut state.key_queue)
     }
 
     /// Returns the controller associated with this KeyboardHidHandler.
-    pub fn controller(&self) -> efi::Handle {
+    pub fn controller(&self) -> Option<Handle> {
         self.controller
     }
 
     #[cfg(test)]
-    pub fn new_for_test(boot_services: &'static T) -> Self {
+    pub fn new_for_test(services: HidServices) -> Self {
         Self {
-            boot_services,
-            controller: core::ptr::null_mut(),
+            services,
+            controller: None,
             hid_io: None,
-            simple_text_in_key: None,
-            simple_text_in_ex_key: None,
-            processor: KeyboardProcessor::new(),
-            state: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, key_queue::KeyQueue::default()),
-            key_notify_event: core::ptr::null_mut(),
-            layout_change_event: core::ptr::null_mut(),
-            layout_context: core::ptr::null_mut(),
-            repeat_timer_event: core::ptr::null_mut(),
-            repeat_context: core::ptr::null_mut(),
-            repeat_key: None,
+            state: TplMutex::new(services.tpl, Tpl::NOTIFY, KeyboardState::new(KeyboardProcessor::new())),
+            root: None,
         }
     }
 
     #[cfg(test)]
-    pub fn set_layout(&mut self, layout: Option<layout::HiiKeyboardLayout>) {
-        self.state.lock().set_layout(layout)
+    pub fn set_layout(&self, layout: Option<layout::HiiKeyboardLayout>) {
+        self.state.lock().key_queue.set_layout(layout)
     }
 
     #[cfg(test)]
-    pub fn set_notify_event(&mut self, event: efi::Event) {
-        self.key_notify_event = event;
+    pub fn set_notify_event(&self, event: Option<Event>) {
+        self.state.lock().key_notify_event = event;
     }
 
     #[cfg(test)]
-    pub fn process_descriptor(&mut self, descriptor: ReportDescriptor) -> Result<(), efi::Status> {
-        self.processor.process_descriptor(descriptor)
+    pub fn process_descriptor(&self, descriptor: ReportDescriptor) -> Result<(), efi::Status> {
+        self.state.lock().processor.process_descriptor(descriptor)
+    }
+
+    #[cfg(test)]
+    pub fn repeat_key(&self) -> Option<Usage> {
+        self.state.lock().processor.repeat_key
     }
 
     // Handles the repeat timer event. When a repeatable key is held, this fires after the initial
     // delay (and then at the repeat rate) to re-enqueue the held key into the key queue.
-    extern "efiapi" fn on_repeat_timer(_event: efi::Event, context: *mut RepeatTimerContext<T>) {
-        // SAFETY: context was set during event registration via Box::into_raw and remains valid for the event lifetime.
-        let Some(context) = (unsafe { context.as_mut() }) else {
-            log::error!("on_repeat_timer invoked with null context pointer");
-            return;
-        };
-
-        // SAFETY: keyboard_handler is set during install_repeat_timer and remains valid until uninstall.
-        let Some(keyboard_handler) = (unsafe { context.keyboard_handler.as_mut() }) else {
-            log::error!("on_repeat_timer invoked with invalid handler");
-            return;
-        };
-
-        let Some(repeat_usage) = keyboard_handler.repeat_key else {
+    fn on_repeat_timer(&self) {
+        let state = &mut *self.state.lock();
+        let Some(repeat_usage) = state.processor.repeat_key else {
             return;
         };
 
         // Re-process the held key as a new KeyDown event. This picks up the current modifier/toggle state.
-        {
-            let mut kq = keyboard_handler.state.lock();
-            kq.keystroke(repeat_usage, key_queue::KeyAction::KeyDown);
-        }
+        state.key_queue.keystroke(repeat_usage, key_queue::KeyAction::KeyDown);
 
         // Signal key notify event if the repeated keystroke matched a registered callback.
+        if state.key_queue.peek_notify_key().is_some()
+            && let Some(key_notify_event) = state.key_notify_event
         {
-            let kq = keyboard_handler.state.lock();
-            if kq.peek_notify_key().is_some() {
-                let _ = keyboard_handler.boot_services.signal_event(keyboard_handler.key_notify_event);
-            }
+            let _ = self.services.events.signal_event(key_notify_event);
         }
 
         // Re-arm the timer at the repeat rate for the next repeat.
-        if let Err(status) = keyboard_handler.boot_services.set_timer(
-            keyboard_handler.repeat_timer_event,
-            EventTimerType::Relative,
-            REPEAT_KEY_RATE,
-        ) {
-            log::error!("on_repeat_timer: failed to re-arm repeat timer, status: {:x?}", status);
+        if let Some(repeat_timer_event) = state.repeat_timer_event
+            && let Err(error) = self.services.timers.set_timer(repeat_timer_event, TimerType::Relative(REPEAT_KEY_RATE))
+        {
+            log::error!("on_repeat_timer: failed to re-arm repeat timer: {:?}", error);
         }
     }
 
     // Handles keyboard layout change events from the HII database.
-    extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut LayoutChangeContext<T>) {
+    fn on_layout_update(&self) {
         log::trace!("on_layout_update: keyboard layout change event received");
-        // SAFETY: context was set during event registration via Box::into_raw and remains valid for the event lifetime.
-        let context = unsafe { context.as_mut() }.expect("bad context pointer");
-
-        if context.keyboard_handler.is_null() {
-            log::error!("on_layout_update invoked with invalid handler");
-            return;
-        }
-
-        // SAFETY: keyboard_handler is null-checked above.
-        let keyboard_handler = unsafe { context.keyboard_handler.as_mut() }.expect("bad keyboard handler");
-
-        // SAFETY: We locate the HII database protocol per UEFI spec.
-        let hii_database_protocol_ptr = unsafe {
-            context.boot_services.locate_protocol_unchecked(&protocols::hii_database::PROTOCOL_GUID, ptr::null_mut())
-        };
-
-        let Ok(hii_database_protocol_ptr) =
-            hii_database_protocol_ptr.map(|p| p as *mut protocols::hii_database::Protocol)
-        else {
+        let Ok(hii_database_protocol_ptr) = Self::locate_hii_database(self.services) else {
             return;
         };
 
@@ -911,7 +851,7 @@ impl<T: BootServices + Clone + 'static> KeyboardHidHandler<T> {
         match layout::keyboard_layout_from_buffer(&keyboard_layout_buffer) {
             Ok(keyboard_layout) => {
                 log::trace!("on_layout_update: successfully parsed layout with {:?} keys", keyboard_layout.keys.len());
-                keyboard_handler.state.lock().set_layout(Some(keyboard_layout));
+                self.state.lock().key_queue.set_layout(Some(keyboard_layout));
             }
             Err(_) => {
                 log::error!("keyboard::on_layout_update: Could not parse keyboard layout buffer.");
@@ -994,79 +934,171 @@ extern "efiapi" fn reset_notification_function(key_data: *mut protocols::simple_
     efi::Status::SUCCESS
 }
 
-impl<T: BootServices + Clone + 'static> HidReportReceiver for KeyboardHidHandler<T> {
-    fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo) {
+impl KeyboardHidHandler {
+    /// Processes an input report from the device.
+    pub(crate) fn receive_report(&self, report: &[u8], hid_io: &dyn HidIo) {
         log::trace!("keyboard::receive_report: {:?} bytes", report.len());
-        let result = {
-            let mut kq = self.state.lock();
-            self.processor.process_report(report, &mut kq)
-        };
+        let output_reports = {
+            let state = &mut *self.state.lock();
+            let processor = &mut state.processor;
+            let kq = &mut state.key_queue;
+            let result = processor.process_report(report, kq);
 
-        // Handle key repeat logic for released and pressed keys. This is done here rather than
-        // in process_report to avoid exposing the processor to boot services and maintain a clean
-        // separation between pure key processing logic and UEFI timer management.
-        if !result.released_keys.is_empty() || !result.pressed_keys.is_empty() {
-            let kq = self.state.lock();
+            // Handle key repeat logic for released and pressed keys. This is done here rather than in process_report
+            // to avoid exposing the processor to UEFI services. The repeat key and timer are updated together under the
+            // lock so the repeat timer callback (which takes the same lock) sees a consistent state.
+            if !result.released_keys.is_empty() || !result.pressed_keys.is_empty() {
+                // Determine the new repeat candidate: prefer a newly pressed repeatable key, otherwise hand off to a
+                // still-held repeatable key if the current repeat key was released.
+                let new_repeat_key = result.pressed_keys.iter().rev().find(|k| kq.is_repeatable_key(**k)).copied();
 
-            // Determine the new repeat candidate: prefer a newly pressed repeatable key,
-            // otherwise hand off to a still-held repeatable key if the current repeat key
-            // was released.
-            let new_repeat_key = result.pressed_keys.iter().rev().find(|k| kq.is_repeatable_key(**k)).copied();
+                let repeat_key_released =
+                    processor.repeat_key.is_some_and(|repeat_usage| result.released_keys.contains(&repeat_usage));
 
-            let repeat_key_released =
-                self.repeat_key.is_some_and(|repeat_usage| result.released_keys.contains(&repeat_usage));
-
-            let next_repeat = if let Some(usage) = new_repeat_key {
-                Some(usage)
-            } else if repeat_key_released {
-                self.processor.held_keys().iter().rev().find(|k| kq.is_repeatable_key(**k)).copied()
-            } else {
-                None
-            };
-
-            // Apply the repeat state change with a single timer operation.
-            if next_repeat.is_some() || repeat_key_released {
-                self.repeat_key = next_repeat;
-                let (timer_type, trigger_time) = match next_repeat {
-                    Some(_) => (EventTimerType::Relative, REPEAT_KEY_DELAY),
-                    None => (EventTimerType::Cancel, 0),
+                let next_repeat = if let Some(usage) = new_repeat_key {
+                    Some(usage)
+                } else if repeat_key_released {
+                    processor.held_keys().iter().rev().find(|k| kq.is_repeatable_key(**k)).copied()
+                } else {
+                    None
                 };
-                if let Err(status) = self.boot_services.set_timer(self.repeat_timer_event, timer_type, trigger_time) {
-                    log::error!("receive_report: failed to set repeat timer, status: {:x?}", status);
+
+                // Apply the repeat state change with a single timer operation.
+                if next_repeat.is_some() || repeat_key_released {
+                    processor.repeat_key = next_repeat;
+                    let timer_type = match next_repeat {
+                        Some(_) => TimerType::Relative(REPEAT_KEY_DELAY),
+                        None => TimerType::Cancel,
+                    };
+                    if let Some(repeat_timer_event) = state.repeat_timer_event
+                        && let Err(error) = self.services.timers.set_timer(repeat_timer_event, timer_type)
+                    {
+                        log::error!("receive_report: failed to set repeat timer: {:?}", error);
+                    }
                 }
             }
-        }
 
-        if result.should_signal_notify {
-            let _ = self.boot_services.signal_event(self.key_notify_event);
-        }
-        if let Err(e) = self.send_output_reports(hid_io, result.output_reports) {
+            if result.should_signal_notify
+                && let Some(key_notify_event) = state.key_notify_event
+            {
+                let _ = self.services.events.signal_event(key_notify_event);
+            }
+            result.output_reports
+        };
+
+        // Device I/O happens after the lock is released.
+        if let Err(e) = self.send_output_reports(hid_io, output_reports) {
             log::error!("unexpected error sending output report: {:?}", e);
         }
     }
 }
 
-impl<T: BootServices + Clone + 'static> Drop for KeyboardHidHandler<T> {
+/// Owner of a leaked [`KeyboardHidHandler`].
+///
+/// Protocol contexts and event closures hold copies of the handler's root pointer. Owning it through a raw pointer
+/// (rather than a `Box`) keeps report delivery from invalidating those copies; every access, here and in callbacks, is
+/// a shared reference derived from the same root.
+pub struct KeyboardReceiver(NonNull<KeyboardHidHandler>);
+
+impl KeyboardReceiver {
+    /// Creates a fully initialized Keyboard HID handler for the given controller.
+    ///
+    /// The handler is leaked at allocation and owned by the returned receiver. Its root pointer is stored in the
+    /// handler, and protocol contexts and event closures copy it rather than deriving pointers from a borrow.
+    pub fn new(services: HidServices, controller: Handle, hid_io: &dyn HidIo) -> Result<Self, efi::Status> {
+        let mut processor = KeyboardProcessor::new();
+        let descriptor = hid_io.get_report_descriptor()?;
+        processor.process_descriptor(descriptor)?;
+
+        // Allocate first so the root pointer can be stored in the handler as it is initialized. All later accesses,
+        // including the protocol contexts and event closures, derive from this one pointer.
+        let root = NonNull::new(Box::into_raw(Box::<KeyboardHidHandler>::new_uninit()).cast::<KeyboardHidHandler>())
+            .expect("Box pointers are non-null");
+        // SAFETY: `root` is a fresh, properly aligned allocation for a `KeyboardHidHandler`.
+        unsafe {
+            root.write(KeyboardHidHandler {
+                services,
+                controller: Some(controller),
+                // SAFETY: hid_io is valid for the device lifetime (backed by a BY_DRIVER protocol
+                // reference in UefiHidIo). Transmute erases the borrow lifetime for raw pointer storage.
+                hid_io: Some(core::mem::transmute::<*const dyn HidIo, *const dyn HidIo>(hid_io as *const dyn HidIo)),
+                state: TplMutex::new(services.tpl, Tpl::NOTIFY, KeyboardState::new(processor)),
+                root: Some(root),
+            })
+        };
+
+        // From here on the receiver owns the allocation, so early returns tear down what was installed.
+        let receiver = Self(root);
+        let handler = receiver.handler();
+
+        handler.reset(true);
+        handler.install_protocol_interfaces(controller)?;
+        if handler.initialize_keyboard_layout()? {
+            log::trace!("KeyboardReceiver::new: no existing layout found, installing default");
+            KeyboardHidHandler::install_default_layout(services)?;
+        }
+        handler.install_repeat_timer()?;
+
+        // Register Ctrl-Alt-Delete handler to reset the system. Register only for DEL scan code;
+        // CTRL-ALT shift state is validated in the callback to handle any left/right combination.
+        #[cfg(feature = "ctrl-alt-del")]
+        {
+            let reset_key_data = protocols::simple_text_input_ex::KeyData {
+                key: protocols::simple_text_input::InputKey { scan_code: key_queue::SCAN_DELETE, unicode_char: 0 },
+                key_state: protocols::simple_text_input_ex::KeyState { key_toggle_state: 0, key_shift_state: 0 },
+            };
+            handler.insert_key_notify_callback(reset_key_data, reset_notification_function);
+        }
+
+        Ok(receiver)
+    }
+}
+
+impl KeyboardReceiver {
+    // Returns a shared reference to the owned handler.
+    fn handler(&self) -> &KeyboardHidHandler {
+        // SAFETY: the pointer was initialized in `new` and is freed only in drop. The handler is never mutably borrowed.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl HidReportReceiver for KeyboardReceiver {
+    fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo) {
+        self.handler().receive_report(report, hid_io)
+    }
+}
+
+impl Drop for KeyboardReceiver {
     fn drop(&mut self) {
+        if self.handler().teardown() {
+            // SAFETY: the pointer came from `Box::into_raw` in `new`, and every event and protocol referencing the
+            // handler has been released, so this is the last use of the pointer.
+            drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+        } else {
+            log::error!("KeyboardReceiver::drop: leaking keyboard handler; event or protocol callbacks may still run");
+        }
+    }
+}
+
+impl KeyboardHidHandler {
+    // Closes events and uninstalls protocols. Returns `false` if anything could not be released, in which case its
+    // callbacks may still reference the handler, so the handler must not be freed.
+    fn teardown(&self) -> bool {
+        let mut released = true;
         // Close repeat timer first — its callback may reference protocol events.
         if let Err(status) = self.uninstall_repeat_timer() {
-            log::error!("KeyboardHidHandler::drop: Failed to close repeat_timer: {:?}", status);
+            log::error!("KeyboardHidHandler::teardown: Failed to close repeat_timer: {:?}", status);
+            released = false;
         }
-        if let Some(key) = self.simple_text_in_key.take()
-            && let Err(status) =
-                simple_text_in::SimpleTextInFfi::<T>::uninstall(self.boot_services, self.controller, key)
-        {
-            log::error!("KeyboardHidHandler::drop: Failed to uninstall simple_text_in: {:?}", status);
-        }
-        if let Some(key) = self.simple_text_in_ex_key.take()
-            && let Err(status) =
-                simple_text_in_ex::SimpleTextInExFfi::<T>::uninstall(self.boot_services, self.controller, key)
-        {
-            log::error!("KeyboardHidHandler::drop: Failed to uninstall simple_text_in_ex: {:?}", status);
+        if let Err(status) = self.uninstall_protocol_interfaces() {
+            log::error!("KeyboardHidHandler::teardown: Failed to uninstall protocol interfaces: {:?}", status);
+            released = false;
         }
         if let Err(status) = self.uninstall_layout_change_event() {
-            log::error!("KeyboardHidHandler::drop: Failed to close layout_change_event: {:?}", status);
+            log::error!("KeyboardHidHandler::teardown: Failed to close layout_change_event: {:?}", status);
+            released = false;
         }
+        released
     }
 }
 
@@ -1987,19 +2019,14 @@ mod test {
 
     mod repeat_tests {
         use super::*;
-        use crate::hid_io::MockHidIo;
+        use crate::{
+            hid_io::MockHidIo,
+            test_stubs::{mock_services, test_event},
+        };
         use hidparser::report_data_types::UsageRange;
-        use patina::boot_services::MockBootServices;
 
-        fn mock_boot_services_for_repeat() -> &'static MockBootServices {
-            let mut mock = MockBootServices::new();
-            mock.expect_raise_tpl().returning(|_| Tpl::APPLICATION);
-            mock.expect_restore_tpl().returning(|_| ());
-            mock.expect_set_timer().returning(|_, _, _| Ok(()));
-            mock.expect_signal_event().returning(|_| Ok(()));
-            mock.expect_close_event().returning(|_| Ok(()));
-            // SAFETY: Leaked to obtain 'static lifetime for test use; never freed.
-            unsafe { &*Box::into_raw(Box::new(mock)) }
+        fn mock_boot_services_for_repeat() -> crate::HidServices {
+            mock_services(|_, _, _| {})
         }
 
         fn boot_keyboard_descriptor() -> ReportDescriptor {
@@ -2069,15 +2096,13 @@ mod test {
             }
         }
 
-        fn setup_handler() -> KeyboardHidHandler<MockBootServices> {
+        fn setup_handler() -> KeyboardHidHandler {
             let boot_services = mock_boot_services_for_repeat();
-            let mut handler = KeyboardHidHandler::new_for_test(boot_services);
+            let handler = KeyboardHidHandler::new_for_test(boot_services);
             handler.process_descriptor(boot_keyboard_descriptor()).unwrap();
             handler.set_layout(Some(layout::get_default_keyboard_layout()));
-            // Set a non-null timer event and a valid context so repeat logic is exercised.
-            handler.repeat_timer_event = 0x42 as efi::Event;
-            let context = Box::into_raw(Box::new(RepeatTimerContext { keyboard_handler: &mut handler as *mut _ }));
-            handler.repeat_context = context;
+            // Set a timer event so repeat logic is exercised.
+            handler.state.lock().repeat_timer_event = Some(test_event(0x42));
             handler
         }
 
@@ -2089,85 +2114,85 @@ mod test {
 
         #[test]
         fn pressing_repeatable_key_sets_repeat_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press key (report value 0x04 → usage KEYBOARD_USAGE_MIN + 4 = 0x00070005)
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
 
-            assert!(handler.repeat_key.is_some());
-            assert_eq!(handler.repeat_key.unwrap(), Usage::from(KEYBOARD_USAGE_MIN + 4));
+            assert!(handler.repeat_key().is_some());
+            assert_eq!(handler.repeat_key().unwrap(), Usage::from(KEYBOARD_USAGE_MIN + 4));
         }
 
         #[test]
         fn releasing_repeat_key_clears_repeat_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press key
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert!(handler.repeat_key.is_some());
+            assert!(handler.repeat_key().is_some());
 
             // Release key
             let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert!(handler.repeat_key.is_none());
+            assert!(handler.repeat_key().is_none());
         }
 
         #[test]
         fn modifier_key_does_not_set_repeat_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press left shift (modifier bit 1, usage 0xE1)
             let report: &[u8] = &[0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert!(handler.repeat_key.is_none());
+            assert!(handler.repeat_key().is_none());
         }
 
         #[test]
         fn releasing_repeat_key_hands_off_to_remaining_held_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press first key (report 0x04 → usage 0x00070005)
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert_eq!(handler.repeat_key, Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
+            assert_eq!(handler.repeat_key(), Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
 
             // Press second key (report 0x05 → usage 0x00070006) while first held
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
             // Second key is the newest pressed, becomes the repeat candidate
-            assert_eq!(handler.repeat_key, Some(Usage::from(KEYBOARD_USAGE_MIN + 5)));
+            assert_eq!(handler.repeat_key(), Some(Usage::from(KEYBOARD_USAGE_MIN + 5)));
 
             // Release second key, first still held → repeat should hand off to first
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert_eq!(handler.repeat_key, Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
+            assert_eq!(handler.repeat_key(), Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
         }
 
         #[test]
         fn new_key_replaces_repeat_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press first key
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert_eq!(handler.repeat_key, Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
+            assert_eq!(handler.repeat_key(), Some(Usage::from(KEYBOARD_USAGE_MIN + 4)));
 
             // Press second key while first still held
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert_eq!(handler.repeat_key, Some(Usage::from(KEYBOARD_USAGE_MIN + 5)));
+            assert_eq!(handler.repeat_key(), Some(Usage::from(KEYBOARD_USAGE_MIN + 5)));
         }
 
         #[test]
         fn on_repeat_timer_enqueues_keystroke() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press key (report 0x04 → usage 0x00070005 = 'b')
@@ -2178,8 +2203,7 @@ mod test {
             let _initial = handler.pop_key();
 
             // Simulate timer callback
-            let mut context = RepeatTimerContext { keyboard_handler: &mut handler as *mut _ };
-            KeyboardHidHandler::on_repeat_timer(ptr::null_mut(), &mut context);
+            handler.on_repeat_timer();
 
             // Should have enqueued a repeat keystroke
             let repeat_key = handler.pop_key();
@@ -2189,17 +2213,125 @@ mod test {
 
         #[test]
         fn reset_clears_repeat_key() {
-            let mut handler = setup_handler();
+            let handler = setup_handler();
             let hid_io = mock_hid_io();
 
             // Press 'a'
             let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
             handler.receive_report(report, &hid_io);
-            assert!(handler.repeat_key.is_some());
+            assert!(handler.repeat_key().is_some());
 
             // Reset should cancel repeat
             handler.reset(false);
-            assert!(handler.repeat_key.is_none());
+            assert!(handler.repeat_key().is_none());
+        }
+    }
+
+    mod teardown_tests {
+        use super::*;
+        use crate::test_stubs::{mock_services, test_event};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use patina::component::service::uefi_services::{event::EventError, protocol::ProtocolError};
+        use std::thread_local;
+
+        thread_local! {
+            static TIMER_CALLBACK: core::cell::RefCell<Option<Box<dyn FnMut(Event)>>> =
+                const { core::cell::RefCell::new(None) };
+        }
+
+        // Leaks a test handler into a receiver and sets its root, mirroring `KeyboardReceiver::new`.
+        fn leaked_receiver(services: crate::HidServices) -> KeyboardReceiver {
+            let root: NonNull<KeyboardHidHandler> =
+                NonNull::new(Box::into_raw(Box::<KeyboardHidHandler>::new_uninit())).unwrap().cast();
+            // SAFETY: root is a fresh, uninitialized allocation for a KeyboardHidHandler.
+            unsafe {
+                root.write(KeyboardHidHandler { root: Some(root), ..KeyboardHidHandler::new_for_test(services) })
+            };
+            KeyboardReceiver(root)
+        }
+
+        #[test]
+        fn repeat_timer_closure_reaches_handler() {
+            static RE_ARMS: AtomicUsize = AtomicUsize::new(0);
+            let services = mock_services(|_, events, timers| {
+                timers.expect_create_timer_event().returning(|_, callback| {
+                    TIMER_CALLBACK.with(|cb| *cb.borrow_mut() = Some(callback));
+                    Ok(test_event(0x42))
+                });
+                timers.expect_set_timer().returning(|_, _| {
+                    RE_ARMS.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                events.expect_close_event().returning(|_| Ok(()));
+            });
+
+            let receiver = leaked_receiver(services);
+            let handler = receiver.handler();
+            handler.install_repeat_timer().unwrap();
+            handler.state.lock().processor.repeat_key = Some(Usage::from(0x00070004u32));
+
+            // The closure reaches the handler and re-arms the timer.
+            TIMER_CALLBACK.with(|cb| (cb.borrow_mut().as_mut().unwrap())(test_event(0x42)));
+            assert_eq!(RE_ARMS.load(Ordering::SeqCst), 1);
+
+            drop(TIMER_CALLBACK.with(|cb| cb.borrow_mut().take()));
+            drop(receiver);
+        }
+
+        #[test]
+        fn installers_require_root() {
+            let services = mock_services(|_, _, _| {});
+            let handler = KeyboardHidHandler::new_for_test(services);
+            assert_eq!(handler.install_repeat_timer(), Err(efi::Status::NOT_READY));
+            assert_eq!(handler.install_layout_change_event(), Err(efi::Status::NOT_READY));
+            assert_eq!(
+                handler.install_protocol_interfaces(crate::test_stubs::test_handle(0x2)),
+                Err(efi::Status::NOT_READY)
+            );
+        }
+
+        #[test]
+        fn teardown_succeeds_when_everything_closes() {
+            let services = mock_services(|_, events, _| {
+                events.expect_close_event().returning(|_| Ok(()));
+            });
+
+            let handler = KeyboardHidHandler::new_for_test(services);
+            handler.state.lock().layout_change_event = Some(test_event(0x43));
+            assert!(handler.teardown());
+            assert!(handler.state.lock().layout_change_event.is_none());
+        }
+
+        #[test]
+        fn teardown_reports_close_failure() {
+            let services = mock_services(|_, events, _| {
+                events.expect_close_event().returning(|_| Err(EventError::InvalidParameter));
+            });
+
+            let handler = KeyboardHidHandler::new_for_test(services);
+            handler.state.lock().layout_change_event = Some(test_event(0x43));
+            assert!(!handler.teardown());
+            // The event is retained, so its callback (if any) still has a live handler to reference.
+            assert_eq!(handler.state.lock().layout_change_event, Some(test_event(0x43)));
+        }
+
+        #[test]
+        fn teardown_reports_protocol_uninstall_failure() {
+            let services = mock_services(|protocols, _, _| {
+                protocols.expect_uninstall_interface().returning(|_, _, _| Err(ProtocolError::AccessDenied));
+            });
+
+            let mut handler = KeyboardHidHandler::new_for_test(services);
+            let ctx = simple_text_in::test::leaked_context(services, &mut handler);
+            handler.controller = Some(crate::test_stubs::test_handle(0x2));
+            handler.state.lock().simple_text_in = ctx;
+
+            assert_eq!(handler.uninstall_protocol_interfaces(), Err(efi::Status::ACCESS_DENIED));
+            handler.state.lock().simple_text_in = ctx;
+            assert!(!handler.teardown());
+
+            // SAFETY: uninstall failed, so the context was not freed; reclaim it for cleanup.
+            drop(unsafe { Box::from_raw(ctx) });
         }
     }
 }

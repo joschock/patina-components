@@ -1,6 +1,6 @@
 //! HID driver binding implementation.
 //!
-//! The [`HidDriver`] implements [`patina::driver_binding::DriverBinding`] to
+//! The [`HidDriver`] implements [`DriverBinding`] to
 //! manage HID instances on controllers that support the HidIo protocol.
 //!
 //! When started on a controller, it creates a [`crate::hid_io::UefiHidIo`]
@@ -15,193 +15,187 @@
 //!
 
 use alloc::{boxed::Box, vec::Vec};
-use core::{ffi::c_void, ptr::NonNull};
-
-use r_efi::{efi, protocols::device_path::Protocol as EfiDevicePathProtocol};
 
 use patina::{
-    BinaryGuid, boot_services::BootServices, driver_binding::DriverBinding, uefi_protocol::ProtocolInterface,
+    BinaryGuid,
+    component::service::uefi_services::{
+        driver_binding::DriverBinding,
+        handle::Handle,
+        protocol::{ProtocolError, ProtocolPtr},
+    },
+    error::EfiError,
+    uefi::device_path::walker::BorrowedDevicePathWalker,
 };
 
 use crate::{
+    HidServices,
     hid_io::{HidReportReceiver, ReceiverFactory, UefiHidIo},
-    keyboard::KeyboardHidHandler,
-    pointer::PointerHidHandler,
+    keyboard::KeyboardReceiver,
+    pointer::PointerReceiver,
 };
 
-/// Per-controller context installed as a private protocol to track the HID instance.
-struct HidInstance<T: BootServices + Clone + 'static> {
-    _device: UefiHidIo<T>,
-}
-
-// SAFETY: HidInstance GUID uniquely identifies this private protocol.
-unsafe impl<T: BootServices + Clone + 'static> ProtocolInterface for HidInstance<T> {
-    const PROTOCOL_GUID: BinaryGuid = BinaryGuid::from_string("0a87cfdb-c482-48e4-ade7-d9f99620e169");
-}
-
-impl<T: BootServices + Clone + 'static> HidInstance<T> {
-    // Creates a new HidInstance wrapping the given device.
-    fn new(device: UefiHidIo<T>) -> Self {
-        Self { _device: device }
-    }
-}
+/// GUID of the private protocol used to track the per-controller [`UefiHidIo`] device.
+const HID_INSTANCE_GUID: BinaryGuid = BinaryGuid::from_string("0a87cfdb-c482-48e4-ade7-d9f99620e169");
 
 /// HID driver that implements [`DriverBinding`].
 ///
 /// Creates and manages HID instances on controllers that expose the HidIo
 /// protocol. Directly constructs [`UefiHidIo`] devices and creates keyboard
 /// and pointer handlers as report receivers.
-pub struct HidDriver<T: BootServices + Clone + 'static> {
-    boot_services: &'static T,
-    agent: efi::Handle,
+pub struct HidDriver {
+    services: HidServices,
 }
 
-impl<T: BootServices + Clone + 'static> HidDriver<T> {
-    /// Creates a new HID driver bound to the given agent handle.
-    ///
-    /// `agent` is the image handle for this driver, used for protocol operations.
-    pub fn new(boot_services: &'static T, agent: efi::Handle) -> Self {
-        Self { boot_services, agent }
+impl HidDriver {
+    /// Creates a new HID driver using the given UEFI services.
+    pub fn new(services: HidServices) -> Self {
+        Self { services }
     }
 
     // Creates factory functions for HID report receivers.
     fn new_receiver_factories(&self) -> Vec<ReceiverFactory> {
-        let bs = self.boot_services;
+        let services = self.services;
         alloc::vec![
             Box::new(move |controller, hid_io| {
-                Ok(PointerHidHandler::new(bs, controller, hid_io)? as Box<dyn HidReportReceiver>)
+                Ok(Box::new(PointerReceiver::new(services, controller, hid_io)?) as Box<dyn HidReportReceiver>)
             }),
             Box::new(move |controller, hid_io| {
-                Ok(KeyboardHidHandler::new(bs, controller, hid_io)? as Box<dyn HidReportReceiver>)
+                Ok(Box::new(KeyboardReceiver::new(services, controller, hid_io)?) as Box<dyn HidReportReceiver>)
             }),
         ]
     }
 }
 
-// controller is an efi::Handle (raw pointer) from the DriverBinding trait. efi::Handle is defined as *mut c_void, but
-// essentially an opaque type that happens to be a pointer. The unsafe deref warning will be resolved once latest
-// r_efi with unsafe API is integrated.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-// This is a wrapper trait to abstract driver binding for FFI; core logic is all tested elsewhere.
-#[coverage(off)]
-impl<T: BootServices + Clone + 'static> DriverBinding for HidDriver<T> {
-    /// Tests if the given controller supports the HidIo protocol.
-    fn driver_binding_supported<U: BootServices + 'static>(
+impl DriverBinding for HidDriver {
+    /// Tests if the given controller supports the HidIo protocol and is not already managed.
+    fn supported(
         &self,
-        _boot_services: &'static U,
-        controller: efi::Handle,
-        _remaining_device_path: Option<NonNull<EfiDevicePathProtocol>>,
-    ) -> Result<bool, efi::Status> {
-        Ok(UefiHidIo::supports(self.boot_services, self.agent, controller))
+        agent: Handle,
+        controller: Handle,
+        _remaining_device_path: Option<BorrowedDevicePathWalker<'_>>,
+    ) -> Result<(), ProtocolError> {
+        UefiHidIo::supports(self.services, agent, controller)
     }
 
     /// Starts HID support for the given controller.
     ///
     /// Creates a UefiHidIo device with keyboard and pointer receivers, and
     /// installs a private protocol to track the instance context.
-    fn driver_binding_start<U: BootServices + 'static>(
-        &mut self,
-        boot_services: &'static U,
-        controller: efi::Handle,
-        _remaining_device_path: Option<NonNull<EfiDevicePathProtocol>>,
-    ) -> Result<(), efi::Status> {
-        log::trace!("driver_binding_start: starting HID on controller {:?}", controller);
-        let device = UefiHidIo::new(self.boot_services, self.agent, controller, self.new_receiver_factories())?;
+    fn start(
+        &self,
+        agent: Handle,
+        controller: Handle,
+        _remaining_device_path: Option<BorrowedDevicePathWalker<'_>>,
+    ) -> Result<(), ProtocolError> {
+        log::trace!("HidDriver::start: starting HID on controller {:?}", controller);
+        let device = UefiHidIo::new(self.services, agent, controller, self.new_receiver_factories())
+            .map_err(|status| ProtocolError::from(EfiError::from(status)))?;
 
-        let hid_instance = Box::new(HidInstance::new(device));
-        boot_services.install_protocol_interface(Some(controller), hid_instance)?;
-
+        let device = Box::into_raw(Box::new(device));
+        let interface = ProtocolPtr::from_raw(device.cast()).expect("Box pointers are non-null");
+        if let Err(error) = self.services.protocols.install_interface(Some(controller), HID_INSTANCE_GUID, interface) {
+            log::error!("HidDriver::start: failed to install HID instance protocol: {error:?}");
+            // SAFETY: device was created by Box::into_raw above and was not published.
+            drop(unsafe { Box::from_raw(device) });
+            return Err(error);
+        }
         Ok(())
     }
 
     /// Stops HID support for the given controller.
     ///
-    /// Retrieves and drops the HID instance context, reclaiming all resources.
-    fn driver_binding_stop<U: BootServices + 'static>(
-        &mut self,
-        boot_services: &'static U,
-        controller: efi::Handle,
-        _number_of_children: usize,
-        _child_handle_buffer: Option<NonNull<efi::Handle>>,
-    ) -> Result<(), efi::Status> {
-        log::trace!("driver_binding_stop: stopping HID on controller {:?}", controller);
-        // SAFETY: The private protocol was installed on this controller by start.
-        let hid_instance = unsafe {
-            boot_services.open_protocol_unchecked(
-                controller,
-                &HidInstance::<T>::PROTOCOL_GUID,
-                self.agent,
-                controller,
-                efi::OPEN_PROTOCOL_GET_PROTOCOL,
-            )
-        }? as *mut HidInstance<T>;
+    /// Retrieves and drops the HID instance context, reclaiming all resources (including closing the HidIo
+    /// protocol opened by start).
+    fn stop(&self, _agent: Handle, controller: Handle, _children: &[Handle]) -> Result<(), ProtocolError> {
+        log::trace!("HidDriver::stop: stopping HID on controller {:?}", controller);
+        let interface = self.services.protocols.interface_on_handle(controller, HID_INSTANCE_GUID)?;
 
-        // SAFETY: Uninstalling our private protocol interface.
-        if let Err(status) = unsafe {
-            boot_services.uninstall_protocol_interface_unchecked(
-                controller,
-                &HidInstance::<T>::PROTOCOL_GUID,
-                hid_instance as *mut c_void,
-            )
-        } {
-            log::error!("hid::driver_binding_stop: failed to uninstall protocol: {status:x?}");
-            return Err(status);
+        if let Err(error) = self.services.protocols.uninstall_interface(controller, HID_INSTANCE_GUID, interface) {
+            log::error!("HidDriver::stop: failed to uninstall HID instance protocol: {error:?}");
+            return Err(error);
         }
 
-        // SAFETY: hid_instance was created via Box::into_raw (through install_protocol_interface) in start.
-        drop(unsafe { Box::from_raw(hid_instance) });
+        // SAFETY: the interface was created via Box::into_raw in start and is no longer published.
+        drop(unsafe { Box::from_raw(interface.as_raw() as *mut UefiHidIo) });
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::HidDriver;
-    use crate::hid_io::protocol::HidIoProtocol;
-    use patina::{boot_services::MockBootServices, driver_binding::DriverBinding};
-    use r_efi::efi;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
-    fn mock_boot_services() -> &'static mut MockBootServices {
-        let mut mock = MockBootServices::new();
-        mock.expect_raise_tpl().returning(|_| patina::boot_services::tpl::Tpl::APPLICATION);
-        mock.expect_restore_tpl().returning(|_| ());
-        // SAFETY: Leaked mock for test use with 'static lifetime requirement.
-        unsafe { Box::into_raw(Box::new(mock)).as_mut().unwrap() }
+    use patina::component::service::uefi_services::{
+        driver_binding::DriverBinding,
+        protocol::{ProtocolError, ProtocolPtr},
+    };
+
+    use super::{HID_INSTANCE_GUID, HidDriver};
+    use crate::{
+        hid_io::protocol::HID_IO_PROTOCOL_GUID,
+        test_stubs::{hid_io_stub, mock_services, test_handle},
+    };
+
+    fn stub_ptr() -> ProtocolPtr {
+        ProtocolPtr::from_raw((hid_io_stub() as *mut _ as *mut core::ffi::c_void).cast()).unwrap()
     }
 
     #[test]
-    fn supported_returns_true_when_hid_io_present() {
-        let boot_services = mock_boot_services();
-        boot_services
-            .expect_open_protocol::<HidIoProtocol>()
-            .withf_st(|controller, _, _, _| *controller == 0x3 as efi::Handle)
-            .returning(|_, _, _, _| {
-                // SAFETY: supports() never dereferences the protocol; zeroed is fine.
-                Ok(crate::test_stubs::hid_io_stub())
+    fn supported_reflects_by_driver_open() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|controller, guid, agent, _| {
+                assert_eq!(guid, HID_IO_PROTOCOL_GUID);
+                assert_eq!(agent, test_handle(0x1));
+                match controller {
+                    c if c == test_handle(0x3) => Ok(stub_ptr()),
+                    c if c == test_handle(0x4) => Err(ProtocolError::AccessDenied),
+                    _ => Err(ProtocolError::NotFound),
+                }
             });
-        boot_services.expect_open_protocol::<HidIoProtocol>().returning(|_, _, _, _| Err(efi::Status::NOT_FOUND));
+            protocols.expect_close_interface().returning(|_, _, _, _| Ok(()));
+        });
 
-        let hid_driver = HidDriver::new(boot_services, 0x1 as efi::Handle);
+        let hid_driver = HidDriver::new(services);
 
-        assert_eq!(hid_driver.driver_binding_supported(boot_services, 0x2 as efi::Handle, None), Ok(false));
-        assert_eq!(hid_driver.driver_binding_supported(boot_services, 0x3 as efi::Handle, None), Ok(true));
+        assert_eq!(hid_driver.supported(test_handle(0x1), test_handle(0x2), None), Err(ProtocolError::NotFound));
+        assert_eq!(hid_driver.supported(test_handle(0x1), test_handle(0x3), None), Ok(()));
+        assert_eq!(hid_driver.supported(test_handle(0x1), test_handle(0x4), None), Err(ProtocolError::AccessDenied));
     }
 
     #[test]
     fn start_returns_unsupported_with_no_receivers() {
-        let boot_services = mock_boot_services();
-        // open_protocol succeeds (protocol exists) but receiver factories fail → UNSUPPORTED.
-        boot_services
-            .expect_open_protocol::<HidIoProtocol>()
-            .returning(|_, _, _, _| Ok(crate::test_stubs::hid_io_stub()));
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|controller, _, agent, _| {
+                assert_eq!(controller, test_handle(0x2));
+                assert_eq!(agent, test_handle(0x1));
+                Ok(stub_ptr())
+            });
+            protocols.expect_close_interface().returning(|_, _, _, _| {
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            protocols.expect_install_interface().never();
+        });
 
-        let mut hid_driver = HidDriver::new(boot_services, 0x1 as efi::Handle);
+        let hid_driver = HidDriver::new(services);
 
-        // All receiver factories fail (stub protocol has no real descriptor) → UNSUPPORTED.
-        assert_eq!(
-            hid_driver.driver_binding_start(boot_services, 0x2 as efi::Handle, None),
-            Err(efi::Status::UNSUPPORTED)
-        );
+        // All receiver factories fail (stub protocol has no real descriptor).
+        assert_eq!(hid_driver.start(test_handle(0x1), test_handle(0x2), None), Err(ProtocolError::Unsupported));
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_returns_error_when_not_started() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_interface_on_handle().returning(|_, guid| {
+                assert_eq!(guid, HID_INSTANCE_GUID);
+                Err(ProtocolError::NotFound)
+            });
+            protocols.expect_uninstall_interface().never();
+        });
+
+        let hid_driver = HidDriver::new(services);
+        assert_eq!(hid_driver.stop(test_handle(0x1), test_handle(0x2), &[]), Err(ProtocolError::NotFound));
     }
 }

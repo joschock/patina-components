@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 log = { workspace = true }
-patina = { workspace = true }
+patina = { workspace = true, features = ["alloc"] }
 r-efi = { workspace = true }
 
 [dev-dependencies]

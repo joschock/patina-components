@@ -239,17 +239,19 @@ mod test {
 
     use crate::{
         device::{ReportCallbackState, UsbHidDescriptors, UsbHidDevice},
-        interrupt_transfers::TransferRecoveryTimer,
         usb_hid_defs::{empty_usb_endpoint_descriptor, empty_usb_interface_descriptor},
     };
 
-    struct NoopTransferRecoveryTimer;
-    impl TransferRecoveryTimer for NoopTransferRecoveryTimer {
-        fn arm_recovery_timer(&self, _event: efi::Event, _delay: u64) -> Result<(), efi::Status> {
-            Ok(())
-        }
+    use patina::component::service::{
+        Service,
+        uefi_services::timer_event::{MockTimerEventServices, TimerEventServices},
+    };
+
+    fn noop_timer_services() -> Service<dyn TimerEventServices> {
+        let mut mock = MockTimerEventServices::new();
+        mock.expect_set_timer().returning(|_, _| Ok(()));
+        Service::mock(Box::new(mock))
     }
-    static NOOP_RECOVERY_TIMER: NoopTransferRecoveryTimer = NoopTransferRecoveryTimer;
 
     // ---- Mock USB IO ----
 
@@ -330,8 +332,8 @@ mod test {
                 report_descriptor,
             },
             report_callback: ReportCallbackState::default(),
-            timer_services: &NOOP_RECOVERY_TIMER,
-            recovery_event: core::ptr::null_mut(),
+            timer_services: noop_timer_services(),
+            recovery_event: None,
         })
     }
 

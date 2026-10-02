@@ -10,9 +10,11 @@
 //! calling TPL:
 //!
 //! 1. **Report callback** (any TPL): locks [`TplMutex`] at TPL_NOTIFY, pushes
-//!    raw bytes onto a [`VecDeque`], signals a TPL_CALLBACK event.
+//!    raw bytes onto a [`Vec`], signals a TPL_CALLBACK event.
 //! 2. **Event handler** (TPL_CALLBACK): locks the same mutex, dequeues all
-//!    pending reports, then dispatches them to all receivers.
+//!    pending reports, then dispatches them to all receivers. The receivers are
+//!    owned by the event's notify closure, so they are only ever touched at
+//!    TPL_CALLBACK and are dropped when the event is closed.
 //!
 //! ## Traits
 //!
@@ -27,19 +29,33 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 pub mod protocol;
-
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-use core::{cell::Cell, ffi::c_void, mem::ManuallyDrop, slice::from_raw_parts};
+use alloc::{boxed::Box, vec::Vec};
+use core::{
+    ffi::c_void,
+    ptr::NonNull,
+    slice::from_raw_parts,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(test)]
 use mockall::automock;
 use r_efi::efi;
 
 use self::protocol::{HID_IO_PROTOCOL_GUID, HidIoProtocol};
+use crate::HidServices;
 use hidparser::ReportDescriptor;
 use patina::{
-    boot_services::{BootServices, event::EventType, tpl::Tpl},
-    tpl_mutex::TplMutex,
+    component::service::{
+        Service,
+        uefi_services::{
+            event::{Event, EventServicesExt, Tpl as ServiceTpl},
+            handle::Handle,
+            protocol::{OpenAttributes, ProtocolError},
+            tpl::TplServices,
+        },
+    },
+    error::EfiError,
+    uefi::{boot_services::tpl::Tpl, tpl_mutex::TplMutex},
 };
 
 /// Interface for logic that receives HID reports from a device.
@@ -53,7 +69,7 @@ pub trait HidReportReceiver {
 ///
 /// Returns the receiver on success, or an error status if the device is not supported
 /// by this receiver type (e.g. wrong report descriptor).
-pub type ReceiverFactory = Box<dyn FnOnce(efi::Handle, &dyn HidIo) -> Result<Box<dyn HidReportReceiver>, efi::Status>>;
+pub type ReceiverFactory = Box<dyn FnOnce(Handle, &dyn HidIo) -> Result<Box<dyn HidReportReceiver>, efi::Status>>;
 
 /// Receiver-facing interface for interacting with a HID device.
 ///
@@ -69,53 +85,94 @@ pub trait HidIo {
 
 // -- ReportQueue ----------------------------------------------------------
 
-/// State for active report reception.
+/// State shared between the HidIo report callback and the TPL_CALLBACK drain event.
 ///
-/// Heap-allocated via [`Box`] for address stability. Shared between the HidIo
-/// report callback (pushes reports) and the TPL_CALLBACK event handler
-/// (processes them and fans out to all receivers).
-struct ReportQueue<T: BootServices + Clone + 'static> {
+/// Heap-allocated via [`Box`] for address stability and owned through a raw pointer by [`UefiHidIo`]. Because the
+/// report callback can preempt the drain event at a higher TPL, only shared references are ever formed once the
+/// queue is published; all mutation goes through interior mutability.
+struct ReportQueue {
     /// Pending report bytes, protected at TPL_NOTIFY.
-    queue: TplMutex<VecDeque<Vec<u8>>, T>,
-    /// Boot services reference for signaling the drain event.
-    boot_services: &'static T,
-    /// TPL_CALLBACK event that triggers [`UefiHidIo::process_queued_reports`].
-    process_queue_event: efi::Event,
-    /// The receivers that process drained reports.
-    receivers: Vec<Box<dyn HidReportReceiver>>,
-    /// Raw pointer to the HidIo protocol for passing `&dyn HidIo` to receivers.
-    hid_io: *const HidIoProtocol,
+    queue: TplMutex<Vec<Vec<u8>>, Service<dyn TplServices>>,
+    /// Services used for signaling the drain event.
+    services: HidServices,
+    /// TPL_CALLBACK event that drains the queue and dispatches reports to the receivers. Written only before the
+    /// report callback is registered.
+    process_queue_event: Option<Event>,
     /// Set to `true` during drop if unregister_report_callback fails. Checked by
     /// `report_callback` to bail early, preventing access to freed resources.
-    poisoned: Cell<bool>,
+    ///
+    /// Atomic because `report_callback` can preempt `drop` at a higher TPL. `Relaxed` ordering suffices: this is a
+    /// standalone one-way flag with no other state to synchronize, and boot services run on a single processor.
+    poisoned: AtomicBool,
+}
+
+impl ReportQueue {
+    fn new(services: HidServices) -> Self {
+        Self {
+            queue: TplMutex::new(services.tpl, Tpl::NOTIFY, Vec::new()),
+            services,
+            process_queue_event: None,
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
+    /// Removes and returns all pending reports.
+    fn take_reports(&self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut *self.queue.lock())
+    }
+}
+
+/// Dispatches each report to every receiver.
+///
+/// Called from the TPL_CALLBACK drain event, ensuring that report processing happens at the lowest possible TPL
+/// regardless of the TPL the report was received at.
+fn dispatch_reports(reports: &[Vec<u8>], receivers: &mut [Box<dyn HidReportReceiver>], hid_io: &dyn HidIo) {
+    log::trace!("dispatch_reports: dispatching {:?} queued reports", reports.len());
+    for report in reports {
+        for receiver in receivers.iter_mut() {
+            receiver.receive_report(report, hid_io);
+        }
+    }
 }
 
 // -- UefiHidIo --------------------------------------------------------------
 
-/// HID device using UEFI boot services to interact with HidIo controllers.
+/// HID device using UEFI services to interact with HidIo controllers.
 ///
 /// Reports are buffered in a [`TplMutex`]-protected queue and processed at
 /// TPL_CALLBACK via a UEFI event, rather than inline from the producer's
 /// callback. The device is fully active from construction; teardown happens on
 /// drop.
-pub struct UefiHidIo<T: BootServices + Clone + 'static> {
+pub struct UefiHidIo {
     hid_io: *const HidIoProtocol,
-    boot_services: &'static T,
-    controller: efi::Handle,
-    agent: efi::Handle,
-    report_queue: ManuallyDrop<Box<ReportQueue<T>>>,
+    services: HidServices,
+    controller: Handle,
+    agent: Handle,
+    /// Owned allocation from `Box::into_raw`; freed in drop only if the report callback was unregistered.
+    report_queue: NonNull<ReportQueue>,
 }
 
-impl<T: BootServices + Clone + 'static> UefiHidIo<T> {
-    /// Returns true if the given controller supports the HidIo protocol.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)] // efi::Handle is an opaque *mut c_void, not dereferenced
-    pub fn supports(boot_services: &'static T, agent: efi::Handle, controller: efi::Handle) -> bool {
-        // SAFETY: HidIoProtocol layout matches the HidIo GUID; ProtocolInterface is correctly implemented.
-        // We only care that the protocol exists, we do not use the resulting reference.
-        unsafe {
-            boot_services
-                .open_protocol::<HidIoProtocol>(controller, agent, controller, efi::OPEN_PROTOCOL_GET_PROTOCOL)
-                .is_ok()
+impl UefiHidIo {
+    /// Returns `Ok(())` if the given controller exposes the HidIo protocol and is not already managed by a driver.
+    ///
+    /// Opens HidIo `BY_DRIVER` (and immediately closes it) so that controllers already managed by this or another
+    /// driver are rejected, per the UEFI Driver Model `Supported()` convention.
+    pub fn supports(services: HidServices, agent: Handle, controller: Handle) -> Result<(), ProtocolError> {
+        services.protocols.open_interface(
+            controller,
+            HID_IO_PROTOCOL_GUID,
+            agent,
+            OpenAttributes::ByDriver { controller: Some(controller) },
+        )?;
+        Self::close_hid_io(services, agent, controller);
+        Ok(())
+    }
+
+    fn close_hid_io(services: HidServices, agent: Handle, controller: Handle) {
+        if let Err(error) =
+            services.protocols.close_interface(controller, HID_IO_PROTOCOL_GUID, agent, Some(controller))
+        {
+            log::error!("Unexpected error closing HidIo protocol: {error:?}");
         }
     }
 
@@ -125,90 +182,86 @@ impl<T: BootServices + Clone + 'static> UefiHidIo<T> {
     /// only those that succeed), creates the report queue, and registers the
     /// protocol callback. Returns `UNSUPPORTED` if no receivers initialize
     /// successfully. The device is released on drop.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)] // efi::Handle is an opaque *mut c_void, not dereferenced
     pub fn new(
-        boot_services: &'static T,
-        agent: efi::Handle,
-        controller: efi::Handle,
+        services: HidServices,
+        agent: Handle,
+        controller: Handle,
         receiver_factories: Vec<ReceiverFactory>,
     ) -> Result<Self, efi::Status> {
-        // SAFETY: HidIoProtocol layout matches the HidIo GUID; ProtocolInterface is correctly implemented.
-        // Open BY_DRIVER to ensure exclusive access to the underlying protocol.
-        let hid_io_raw = unsafe {
-            boot_services.open_protocol::<HidIoProtocol>(controller, agent, controller, efi::OPEN_PROTOCOL_BY_DRIVER)
-        }?;
-
-        let hid_io = hid_io_raw as *const HidIoProtocol;
+        // Open BY_DRIVER to ensure exclusive access to the underlying protocol. It is closed explicitly on drop.
+        let hid_io = services
+            .protocols
+            .open_interface(
+                controller,
+                HID_IO_PROTOCOL_GUID,
+                agent,
+                OpenAttributes::ByDriver { controller: Some(controller) },
+            )
+            .map_err(|error| efi::Status::from(EfiError::from(error)))?
+            .as_raw() as *const HidIoProtocol;
 
         // SAFETY: hid_io points to a protocol opened BY_DRIVER above; valid for our lifetime.
         let hid_io_ref = unsafe { &*hid_io };
 
         // Create receivers from factories, keeping only those that succeed.
-        let receivers: Vec<_> =
+        let mut receivers: Vec<_> =
             receiver_factories.into_iter().filter_map(|factory| factory(controller, hid_io_ref).ok()).collect();
 
         if receivers.is_empty() {
             // No receivers initialized — close the protocol and report unsupported.
             log::trace!("UefiHidIo::new: no receivers initialized, returning UNSUPPORTED");
-            if let Err(status) =
-                boot_services.close_protocol(controller, HID_IO_PROTOCOL_GUID.as_efi_guid(), agent, controller)
-            {
-                log::error!("Unexpected error closing HidIo protocol: {status:x?}");
-            }
+            Self::close_hid_io(services, agent, controller);
             return Err(efi::Status::UNSUPPORTED);
         }
 
-        // Build the report queue.
-        let mut report_queue = Box::new(ReportQueue {
-            queue: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, VecDeque::new()),
-            boot_services,
-            process_queue_event: core::ptr::null_mut(),
-            receivers,
-            hid_io,
-            poisoned: Cell::new(false),
-        });
+        let receiver_count = receivers.len();
+        // Hand ownership to a raw pointer immediately; from here on the queue is only accessed through it.
+        let report_queue = NonNull::from(Box::leak(Box::new(ReportQueue::new(services))));
 
-        let queue_ptr: *mut ReportQueue<T> = &mut *report_queue;
+        // The drain closure owns the receivers: they are only used at TPL_CALLBACK and are dropped when the event
+        // is closed, which happens before HidIo is closed.
+        let process_queue_event = services
+            .events
+            .on_event(ServiceTpl::Callback, move || {
+                // SAFETY: report_queue remains valid for the event's lifetime (the event is closed before the
+                // allocation is freed).
+                let reports = unsafe { report_queue.as_ref() }.take_reports();
+                // Any reports queued while dispatching re-signal this event, so none are missed.
+                // SAFETY: hid_io points to a protocol opened BY_DRIVER, which is closed only after this event.
+                dispatch_reports(&reports, &mut receivers, unsafe { &*hid_io });
+            })
+            .map_err(|error| {
+                // SAFETY: report_queue was allocated via Box above. Event creation failed and the report callback
+                // is not registered, so nothing else references it.
+                drop(unsafe { Box::from_raw(report_queue.as_ptr()) });
+                Self::close_hid_io(services, agent, controller);
+                efi::Status::from(EfiError::from(error))
+            })?;
 
-        // SAFETY: queue_ptr is heap-allocated via Box and remains valid for the event's lifetime
-        // (the event is closed before the Box is dropped).
-        let process_queue_event = unsafe {
-            boot_services.create_event_unchecked::<ReportQueue<T>>(
-                EventType::NOTIFY_SIGNAL,
-                Tpl::CALLBACK,
-                Some(Self::process_queued_reports),
-                queue_ptr,
-            )
-        }
-        .inspect_err(|_| {
-            let _ = boot_services.close_protocol(controller, HID_IO_PROTOCOL_GUID.as_efi_guid(), agent, controller);
-        })?;
+        // Set before the queue is published to report_callback so it can safely signal the event.
+        // SAFETY: the queue is not yet shared with report_callback, and the event has not been signaled, so no
+        // other reference to it exists.
+        unsafe { (*report_queue.as_ptr()).process_queue_event = Some(process_queue_event) };
 
-        report_queue.process_queue_event = process_queue_event;
-
-        // Register the HidIo callback. This must happen after process_queue_event is stored so the
-        // report_callback can safely signal it. This also configures HidIo to start sending reports.
-        // SAFETY: hid_io points to a protocol opened BY_DRIVER above; valid for our lifetime.
-        let hid_io_protocol = unsafe { &*hid_io };
+        // Register the HidIo callback. This also configures HidIo to start sending reports.
         // SAFETY: hid_io points to a valid protocol; callback and context are valid.
         match unsafe {
-            (hid_io_protocol.register_report_callback)(hid_io, Self::report_callback, queue_ptr as *mut c_void)
+            (hid_io_ref.register_report_callback)(hid_io, Self::report_callback, report_queue.as_ptr().cast())
         } {
             efi::Status::SUCCESS => (),
             err => {
-                let _ = boot_services.close_event(process_queue_event);
-                let _ = boot_services.close_protocol(controller, HID_IO_PROTOCOL_GUID.as_efi_guid(), agent, controller);
+                let _ = services.events.close_event(process_queue_event);
+                Self::close_hid_io(services, agent, controller);
+                // SAFETY: report_queue was allocated via Box above. The report callback was not registered and
+                // process_queue_event is closed, so nothing else references it.
+                drop(unsafe { Box::from_raw(report_queue.as_ptr()) });
                 return Err(err);
             }
         }
 
-        log::trace!(
-            "UefiHidIo::new: initialized with {:?} receivers on controller {:?}",
-            report_queue.receivers.len(),
-            controller
-        );
+        log::trace!("UefiHidIo::new: initialized with {:?} receivers on controller {:?}", receiver_count, controller);
 
-        Ok(Self { hid_io, boot_services, controller, agent, report_queue: ManuallyDrop::new(report_queue) })
+        Ok(Self { hid_io, services, controller, agent, report_queue })
     }
 
     /// HidIo protocol report callback. Enqueues the report and signals the drain event. This runs at
@@ -223,12 +276,11 @@ impl<T: BootServices + Clone + 'static> UefiHidIo<T> {
         report_buffer: *mut c_void,
         context: *mut c_void,
     ) {
-        // SAFETY: context is a valid *mut ReportQueue<T> set during register_report_callback in new().
+        // SAFETY: context is a valid *mut ReportQueue set during register_report_callback in new().
         // The HidIo protocol callback signature requires *mut c_void, but this function only takes a
         // shared reference; no mutable aliasing occurs because mutation goes through the TplMutex on the queue.
-        let report_queue =
-            unsafe { (context as *const ReportQueue<T>).as_ref() }.expect("null report_callback context");
-        if report_queue.poisoned.get() {
+        let report_queue = unsafe { (context as *const ReportQueue).as_ref() }.expect("null report_callback context");
+        if report_queue.poisoned.load(Ordering::Relaxed) {
             return;
         }
         // SAFETY: report_buffer is valid for report_buffer_size bytes per HidIo protocol contract.
@@ -236,38 +288,15 @@ impl<T: BootServices + Clone + 'static> UefiHidIo<T> {
         log::trace!("report_callback: received report, size: {:?}", report_buffer_size);
         {
             let mut queue = report_queue.queue.lock();
-            queue.push_back(report.to_vec());
+            queue.push(report.to_vec());
         }
-        let _ = report_queue.boot_services.signal_event(report_queue.process_queue_event);
-    }
-
-    /// Event handler that dequeues pending reports and dispatches them to all receivers.
-    /// This runs at TPL_CALLBACK, ensuring that processing for events happens at the lowest possible TPL regardless of
-    /// the TPL the report was received at.
-    extern "efiapi" fn process_queued_reports(_event: efi::Event, context: *mut ReportQueue<T>) {
-        // SAFETY: context is a valid *mut ReportQueue<T> set during event creation.
-        let report_queue = unsafe { context.as_mut() }.expect("null process_queued_reports context");
-        let reports: Vec<Vec<u8>> = {
-            let mut queue = report_queue.queue.lock();
-            queue.drain(..).collect()
-        };
-
-        log::trace!("process_queued_reports: draining {:?} queued reports", reports.len());
-
-        // Any additional events that are queued while processing will also trigger a signal on this event,
-        // which will re-queue this function. So we don't need to worry about missing reports.
-
-        // SAFETY: hid_io points to a protocol opened BY_DRIVER; valid for device lifetime.
-        let hid_io = unsafe { &*report_queue.hid_io };
-        for report in &reports {
-            for receiver in &mut report_queue.receivers {
-                receiver.receive_report(report, hid_io);
-            }
+        if let Some(event) = report_queue.process_queue_event {
+            let _ = report_queue.services.events.signal_event(event);
         }
     }
 }
 
-impl<T: BootServices + Clone + 'static> Drop for UefiHidIo<T> {
+impl Drop for UefiHidIo {
     fn drop(&mut self) {
         // SAFETY: hid_io points to a protocol opened BY_DRIVER in new; valid until this drop.
         let hid_io_protocol = unsafe { &*self.hid_io };
@@ -275,29 +304,29 @@ impl<T: BootServices + Clone + 'static> Drop for UefiHidIo<T> {
         let unregister_status =
             unsafe { (hid_io_protocol.unregister_report_callback)(self.hid_io, Self::report_callback) };
 
+        // SAFETY: report_queue is valid until freed below; only shared references are formed.
+        let report_queue = unsafe { self.report_queue.as_ref() };
+
         if unregister_status != efi::Status::SUCCESS {
-            // Callback may still fire — poison the queue so report_callback becomes a no-op,
-            // and leak the Box so the memory it dereferences remains valid.
-            self.report_queue.poisoned.set(true);
+            // Callback may still fire — poison the queue so report_callback becomes a no-op, and leak the queue so
+            // the memory it dereferences remains valid. The receivers are owned by the event closure (not the
+            // queue), so they are still released when the event is closed below.
+            report_queue.poisoned.store(true, Ordering::Relaxed);
             log::error!(
                 "Failed to unregister report callback: {unregister_status:x?}. \
                  Leaking ReportQueue to prevent use-after-free."
             );
         }
 
-        let _ = self.boot_services.close_event(self.report_queue.process_queue_event);
-        if let Err(status) = self.boot_services.close_protocol(
-            self.controller,
-            HID_IO_PROTOCOL_GUID.as_efi_guid(),
-            self.agent,
-            self.controller,
-        ) {
-            log::error!("Unexpected error closing HidIo protocol: {status:x?}");
+        if let Some(event) = report_queue.process_queue_event {
+            let _ = self.services.events.close_event(event);
         }
+        Self::close_hid_io(self.services, self.agent, self.controller);
 
         if unregister_status == efi::Status::SUCCESS {
-            // SAFETY: No more callbacks can fire; safe to free the report queue.
-            unsafe { ManuallyDrop::drop(&mut self.report_queue) };
+            // SAFETY: the callback is unregistered and the event is closed, so nothing else references the queue;
+            // it was allocated via Box in new.
+            drop(unsafe { Box::from_raw(self.report_queue.as_ptr()) });
         }
     }
 }
@@ -307,27 +336,26 @@ mod test {
     use alloc::{boxed::Box, vec};
     use core::{
         ffi::c_void,
-        sync::atomic::{AtomicPtr, Ordering},
+        sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
 
     use r_efi::efi;
 
     use super::protocol::{HidIoReportCallback, HidReportType};
-
-    use patina::boot_services::MockBootServices;
+    use crate::test_stubs::{mock_services, test_handle};
+    use patina::component::service::uefi_services::{
+        event::EventError,
+        protocol::{ProtocolError, ProtocolPtr},
+    };
 
     use super::*;
 
-    fn mock_boot_services() -> &'static mut MockBootServices {
-        let mut mock = MockBootServices::new();
-        mock.expect_raise_tpl().returning(|_| Tpl::APPLICATION);
-        mock.expect_restore_tpl().returning(|_| ());
-        // SAFETY: Leaked mock for test use with 'static lifetime requirement.
-        unsafe { Box::into_raw(Box::new(mock)).as_mut().unwrap() }
-    }
-
     fn mock_hid_io_protocol() -> &'static mut HidIoProtocol {
         crate::test_stubs::hid_io_stub()
+    }
+
+    fn protocol_ptr(protocol: &'static mut HidIoProtocol) -> ProtocolPtr {
+        ProtocolPtr::from_raw((protocol as *mut HidIoProtocol).cast()).unwrap()
     }
 
     /// A factory that always succeeds, returning a no-op receiver.
@@ -340,41 +368,16 @@ mod test {
         Box::new(|_, _| Err(efi::Status::UNSUPPORTED))
     }
 
-    /// Creates a UefiHidIo with a mock protocol and a single no-op receiver.
-    /// `setup` is called on the receiver mock before it's boxed.
-    fn make_hid_device(
-        setup: impl FnOnce(&mut MockBootServices, &mut MockHidReportReceiver),
-    ) -> UefiHidIo<MockBootServices> {
-        let boot_services = mock_boot_services();
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
-        boot_services.expect_close_event().returning(|_| Ok(()));
-        boot_services
-            .expect_create_event_unchecked::<ReportQueue<MockBootServices>>()
-            .returning(|_, _, _, _| Ok(0xE0E as efi::Event));
-
-        let mut receiver = MockHidReportReceiver::new();
-        setup(boot_services, &mut receiver);
-
-        let hid_io_protocol = mock_hid_io_protocol();
-        let hid_io = hid_io_protocol as *const HidIoProtocol;
-
-        let receivers: Vec<Box<dyn HidReportReceiver>> = vec![Box::new(receiver)];
-        let mut report_queue = Box::new(ReportQueue {
-            poisoned: Cell::new(false),
-            queue: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, VecDeque::new()),
-            boot_services,
-            process_queue_event: core::ptr::null_mut(),
-            receivers,
-            hid_io,
-        });
-        report_queue.process_queue_event = 0xE0E as efi::Event;
-
+    /// Builds a UefiHidIo directly around the given protocol, bypassing `new`.
+    fn make_hid_device(services: HidServices, hid_io: *const HidIoProtocol) -> UefiHidIo {
+        let mut report_queue = Box::new(ReportQueue::new(services));
+        report_queue.process_queue_event = Some(crate::test_stubs::test_event(0xE0E));
         UefiHidIo {
             hid_io,
-            boot_services,
-            controller: core::ptr::null_mut(),
-            agent: core::ptr::null_mut(),
-            report_queue: ManuallyDrop::new(report_queue),
+            services,
+            controller: test_handle(0x2),
+            agent: test_handle(0x1),
+            report_queue: NonNull::from(Box::leak(report_queue)),
         }
     }
 
@@ -390,37 +393,121 @@ mod test {
     }
 
     #[test]
-    fn new_returns_error_when_open_protocol_fails() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_open_protocol::<HidIoProtocol>().returning(|_, _, _, _| Err(efi::Status::NOT_FOUND));
+    fn supports_opens_by_driver_and_closes() {
+        static CLOSES: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|controller, guid, agent, attributes| {
+                assert_eq!(guid, HID_IO_PROTOCOL_GUID);
+                assert_eq!(agent, test_handle(0x1));
+                assert_eq!(attributes, OpenAttributes::ByDriver { controller: Some(controller) });
+                if controller == test_handle(0x3) {
+                    Ok(protocol_ptr(mock_hid_io_protocol()))
+                } else {
+                    Err(ProtocolError::NotFound)
+                }
+            });
+            protocols.expect_close_interface().returning(|controller, guid, agent, by_controller| {
+                assert_eq!(controller, test_handle(0x3));
+                assert_eq!(guid, HID_IO_PROTOCOL_GUID);
+                assert_eq!(agent, test_handle(0x1));
+                assert_eq!(by_controller, Some(test_handle(0x3)));
+                CLOSES.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
+        assert_eq!(UefiHidIo::supports(services, test_handle(0x1), test_handle(0x2)), Err(ProtocolError::NotFound));
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 0);
+        assert_eq!(UefiHidIo::supports(services, test_handle(0x1), test_handle(0x3)), Ok(()));
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 1);
+    }
 
-        let result = UefiHidIo::new(boot_services, core::ptr::null_mut(), core::ptr::null_mut(), vec![ok_factory()]);
+    #[test]
+    fn supports_rejects_already_managed_controller() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| Err(ProtocolError::AlreadyStarted));
+            protocols.expect_close_interface().never();
+        });
+        assert_eq!(
+            UefiHidIo::supports(services, test_handle(0x1), test_handle(0x2)),
+            Err(ProtocolError::AlreadyStarted)
+        );
+    }
+
+    #[test]
+    fn new_returns_error_when_open_protocol_fails() {
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| Err(ProtocolError::NotFound));
+        });
+        let result = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![ok_factory()]);
         assert_eq!(result.err(), Some(efi::Status::NOT_FOUND));
     }
 
     #[test]
-    fn new_returns_unsupported_when_no_receivers_initialize() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_open_protocol::<HidIoProtocol>().returning(|_, _, _, _| Ok(mock_hid_io_protocol()));
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
+    fn new_opens_by_driver_with_agent() {
+        static CLOSES: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|controller, guid, agent, attributes| {
+                assert_eq!(guid, HID_IO_PROTOCOL_GUID);
+                assert_eq!(agent, test_handle(0x1));
+                assert_eq!(attributes, OpenAttributes::ByDriver { controller: Some(controller) });
+                Ok(protocol_ptr(mock_hid_io_protocol()))
+            });
+            protocols.expect_close_interface().returning(|controller, guid, agent, by_controller| {
+                assert_eq!(guid, HID_IO_PROTOCOL_GUID);
+                assert_eq!(agent, test_handle(0x1));
+                assert_eq!(by_controller, Some(controller));
+                CLOSES.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let result = UefiHidIo::new(boot_services, core::ptr::null_mut(), core::ptr::null_mut(), vec![err_factory()]);
-        assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
+        let device = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![ok_factory()]).unwrap();
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 0);
+        drop(device);
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn new_returns_unsupported_when_receivers_vec_is_empty() {
-        let boot_services = mock_boot_services();
-        boot_services.expect_open_protocol::<HidIoProtocol>().returning(|_, _, _, _| Ok(mock_hid_io_protocol()));
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
+    fn new_returns_unsupported_when_no_receivers_initialize() {
+        static CLOSES: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| Ok(protocol_ptr(mock_hid_io_protocol())));
+            protocols.expect_close_interface().returning(|_, _, _, _| {
+                CLOSES.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
 
-        let result = UefiHidIo::new(boot_services, core::ptr::null_mut(), core::ptr::null_mut(), vec![]);
+        let result = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![err_factory()]);
         assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
+        let result = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![]);
+        assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn new_closes_protocol_when_event_creation_fails() {
+        static CLOSES: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| Ok(protocol_ptr(mock_hid_io_protocol())));
+            protocols.expect_close_interface().returning(|_, _, _, _| {
+                CLOSES.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            events.expect_create_event().returning(|_, _| Err(EventError::Internal));
+        });
+
+        let result = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![ok_factory()]);
+        assert_eq!(result.err(), Some(efi::Status::UNSUPPORTED));
+        assert_eq!(CLOSES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn hid_io_set_output_report_calls_protocol() {
-        let device = make_hid_device(|_, _| {});
+        let services = mock_services(|protocols, _, _| {
+            protocols.expect_close_interface().returning(|_, _, _, _| Ok(()));
+        });
+        let device = make_hid_device(services, mock_hid_io_protocol());
 
         extern "efiapi" fn mock_set_report(
             _this: *const HidIoProtocol,
@@ -445,78 +532,109 @@ mod test {
     }
 
     #[test]
-    fn report_callback_enqueues_and_process_queued_reports_delivers_to_all() {
+    fn report_callback_enqueues_and_event_delivers_to_all() {
         static CALLBACK_CONTEXT: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
-
-        let boot_services = mock_boot_services();
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
-        boot_services.expect_close_event().returning(|_| Ok(()));
-        boot_services
-            .expect_create_event_unchecked::<ReportQueue<MockBootServices>>()
-            .returning(|_, _, _, _| Ok(0xE0E as efi::Event));
-        boot_services.expect_signal_event().returning(|_| Ok(()));
-
-        let hid_io_protocol = mock_hid_io_protocol();
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        std::thread_local! {
+            static NOTIFY: core::cell::RefCell<Option<Box<dyn FnMut(Event)>>> = const { core::cell::RefCell::new(None) };
+        }
 
         extern "efiapi" fn register_cb(
             _this: *const HidIoProtocol,
             _callback: HidIoReportCallback,
             context: *mut c_void,
         ) -> efi::Status {
-            CALLBACK_CONTEXT.store(context, Ordering::Relaxed);
+            CALLBACK_CONTEXT.store(context, Ordering::SeqCst);
             efi::Status::SUCCESS
         }
-        hid_io_protocol.register_report_callback = register_cb;
 
-        let hid_io = hid_io_protocol as *const HidIoProtocol;
-
-        let mut r1 = MockHidReportReceiver::new();
-        r1.expect_receive_report().withf(|report, _| report == [0x10u8, 0x20, 0x30]).times(1).return_const(());
-        let mut r2 = MockHidReportReceiver::new();
-        r2.expect_receive_report().withf(|report, _| report == [0x10u8, 0x20, 0x30]).times(1).return_const(());
-
-        let receivers: Vec<Box<dyn HidReportReceiver>> = vec![Box::new(r1), Box::new(r2)];
-        let mut report_queue = Box::new(ReportQueue {
-            poisoned: Cell::new(false),
-            queue: TplMutex::new((*boot_services).clone(), Tpl::NOTIFY, VecDeque::new()),
-            boot_services,
-            process_queue_event: core::ptr::null_mut(),
-            receivers,
-            hid_io,
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| {
+                let protocol = mock_hid_io_protocol();
+                protocol.register_report_callback = register_cb;
+                Ok(protocol_ptr(protocol))
+            });
+            protocols.expect_close_interface().returning(|_, _, _, _| Ok(()));
+            events.expect_create_event().returning(|tpl, callback| {
+                assert_eq!(tpl, ServiceTpl::Callback);
+                NOTIFY.with(|notify| *notify.borrow_mut() = Some(callback));
+                Ok(crate::test_stubs::test_event(0xE0E))
+            });
+            events.expect_signal_event().returning(|_| {
+                SIGNALS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
         });
-        report_queue.process_queue_event = 0xE0E as efi::Event;
 
-        let mut device = UefiHidIo {
-            hid_io,
-            boot_services,
-            controller: core::ptr::null_mut(),
-            agent: core::ptr::null_mut(),
-            report_queue: ManuallyDrop::new(report_queue),
-        };
+        let factories: Vec<ReceiverFactory> = vec![
+            Box::new(|_, _| {
+                let mut r = MockHidReportReceiver::new();
+                r.expect_receive_report().withf(|report, _| report == [0x10u8, 0x20, 0x30]).times(1).return_const(());
+                Ok(Box::new(r) as Box<dyn HidReportReceiver>)
+            }),
+            Box::new(|_, _| {
+                let mut r = MockHidReportReceiver::new();
+                r.expect_receive_report().withf(|report, _| report == [0x10u8, 0x20, 0x30]).times(1).return_const(());
+                Ok(Box::new(r) as Box<dyn HidReportReceiver>)
+            }),
+        ];
+        let device = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), factories).unwrap();
 
         // Simulate the HidIo producer calling report_callback.
         let report_data = [0x10u8, 0x20, 0x30];
-        let queue_ptr: *mut ReportQueue<MockBootServices> = &mut **device.report_queue as *mut _;
-        // SAFETY: test-only call with valid report data and context.
+        // SAFETY: test-only call with valid report data and the registered context.
         unsafe {
-            UefiHidIo::<MockBootServices>::report_callback(
+            UefiHidIo::report_callback(
                 report_data.len() as u16,
                 report_data.as_ptr() as *mut c_void,
-                queue_ptr as *mut c_void,
+                CALLBACK_CONTEXT.load(Ordering::SeqCst),
             );
         }
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
 
-        // Manually invoke the process_queued_reports handler (normally triggered by the UEFI event system).
-        UefiHidIo::<MockBootServices>::process_queued_reports(core::ptr::null_mut(), queue_ptr);
-        // MockHidReportReceivers will verify expectations on drop.
+        // Fire the process-queue event (normally dispatched by the UEFI event system).
+        NOTIFY.with(|notify| (notify.borrow_mut().as_mut().unwrap())(crate::test_stubs::test_event(0xE0E)));
+
+        drop(device);
+        // The receivers are owned by the event closure; dropping it verifies the MockHidReportReceiver expectations.
+        drop(NOTIFY.with(|notify| notify.borrow_mut().take()));
     }
 
     #[test]
-    fn drop_unregisters_callback_and_closes_protocol() {
-        let device = make_hid_device(|_, _| {});
-        drop(device);
-        // MockBootServices expectations for close_protocol and close_event
-        // are verified on drop.
+    fn report_callback_is_noop_when_poisoned() {
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_close_interface().returning(|_, _, _, _| Ok(()));
+            events.expect_signal_event().never();
+        });
+        let device = make_hid_device(services, mock_hid_io_protocol());
+        // SAFETY: report_queue is valid for the device's lifetime.
+        let report_queue = unsafe { device.report_queue.as_ref() };
+        report_queue.poisoned.store(true, Ordering::Relaxed);
+        let report_data = [0x1u8];
+        // SAFETY: test-only call with valid report data and context.
+        unsafe {
+            UefiHidIo::report_callback(1, report_data.as_ptr() as *mut c_void, device.report_queue.as_ptr().cast())
+        };
+        assert!(report_queue.queue.lock().is_empty());
+    }
+
+    #[test]
+    fn drop_closes_event_and_protocol() {
+        static CLOSED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+        static CLOSED_PROTOCOLS: AtomicUsize = AtomicUsize::new(0);
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_close_interface().returning(|_, _, _, _| {
+                CLOSED_PROTOCOLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            events.expect_close_event().returning(|_| {
+                CLOSED_EVENTS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        });
+        drop(make_hid_device(services, mock_hid_io_protocol()));
+        assert_eq!(CLOSED_EVENTS.load(Ordering::SeqCst), 1);
+        assert_eq!(CLOSED_PROTOCOLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -528,20 +646,28 @@ mod test {
         ) -> efi::Status {
             efi::Status::DEVICE_ERROR
         }
+        static CLOSED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+        static CLOSED_PROTOCOLS: AtomicUsize = AtomicUsize::new(0);
 
-        let boot_services = mock_boot_services();
-        boot_services.expect_open_protocol::<HidIoProtocol>().returning(|_, _, _, _| {
-            let protocol = mock_hid_io_protocol();
-            protocol.register_report_callback = failing_register;
-            Ok(protocol)
+        let services = mock_services(|protocols, events, _| {
+            protocols.expect_open_interface().returning(|_, _, _, _| {
+                let protocol = mock_hid_io_protocol();
+                protocol.register_report_callback = failing_register;
+                Ok(protocol_ptr(protocol))
+            });
+            protocols.expect_close_interface().returning(|_, _, _, _| {
+                CLOSED_PROTOCOLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            events.expect_close_event().returning(|_| {
+                CLOSED_EVENTS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
         });
-        boot_services.expect_close_protocol().returning(|_, _, _, _| Ok(()));
-        boot_services.expect_close_event().returning(|_| Ok(()));
-        boot_services
-            .expect_create_event_unchecked::<ReportQueue<MockBootServices>>()
-            .returning(|_, _, _, _| Ok(0xE0E as efi::Event));
 
-        let result = UefiHidIo::new(boot_services, core::ptr::null_mut(), core::ptr::null_mut(), vec![ok_factory()]);
+        let result = UefiHidIo::new(services, test_handle(0x1), test_handle(0x2), vec![ok_factory()]);
         assert_eq!(result.err(), Some(efi::Status::DEVICE_ERROR));
+        assert_eq!(CLOSED_EVENTS.load(Ordering::SeqCst), 1);
+        assert_eq!(CLOSED_PROTOCOLS.load(Ordering::SeqCst), 1);
     }
 }
