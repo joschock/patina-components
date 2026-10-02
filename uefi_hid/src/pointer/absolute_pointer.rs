@@ -14,7 +14,11 @@ use r_efi::{efi, protocols};
 
 use hidparser::report_data_types::Usage;
 
-use patina::component::service::uefi_services::{event::Event, handle::Handle, protocol::ProtocolPtr};
+use patina::component::service::uefi_services::{
+    event::{Event, EventServicesExt, Tpl},
+    handle::Handle,
+    protocol::ProtocolPtr,
+};
 
 use super::{
     AXIS_RESOLUTION, BUTTON_MAX, BUTTON_MIN, DIGITIZER_SWITCH_MAX, DIGITIZER_SWITCH_MIN, GENERIC_DESKTOP_WHEEL,
@@ -54,11 +58,12 @@ impl AbsolutePointerFfi {
         pointer_handler: *const PointerHidHandler,
         mode: protocols::absolute_pointer::Mode,
     ) -> Result<*mut Self, efi::Status> {
-        // TODO: wait_for_input must be a NOTIFY_WAIT event whose notify function calls
-        // `signal_if_input_available`. Patina EventServices does not yet support creating NOTIFY_WAIT events, so an
-        // unarmed timer event with no notify function is used as a placeholder. Until this is replaced, WaitForEvent
-        // on wait_for_input will not complete.
-        let wait_for_input_event = services.timers.create_timer_event_no_notify().map_err(to_status)?;
+        let wait_for_input_event = services
+            .events
+            .on_wait_event(Tpl::Notify, move |event| {
+                Self::signal_if_input_available(services, pointer_handler, event);
+            })
+            .map_err(to_status)?;
 
         let pointer_ctx = Box::into_raw(Box::new(AbsolutePointerFfi {
             absolute_pointer: protocols::absolute_pointer::Protocol {
@@ -79,7 +84,9 @@ impl AbsolutePointerFfi {
         ) {
             Ok(_) => Ok(pointer_ctx),
             Err(error) => {
-                let _ = services.events.close_event(wait_for_input_event);
+                if let Err(error) = services.events.close_event(wait_for_input_event) {
+                    log::error!("Failed to close wait_for_input after install failure: {:?}", error);
+                }
                 // SAFETY: pointer_ctx was created by Box::into_raw above and was not published.
                 drop(unsafe { Box::from_raw(pointer_ctx) });
                 Err(to_status(error))
@@ -163,13 +170,13 @@ impl AbsolutePointerFfi {
     /// Signals `event` if pointer input is available.
     ///
     /// This is the notify logic for the wait_for_input event.
-    // TODO: invoke from the wait_for_input NOTIFY_WAIT notify function once Patina EventServices supports it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn signal_if_input_available(&self, event: Event) {
+    fn signal_if_input_available(services: HidServices, pointer_handler: *const PointerHidHandler, event: Event) {
         // SAFETY: pointer_handler validity is ensured by the protocol lifecycle.
-        if let Some(pointer_handler) = unsafe { self.pointer_handler.as_ref() } {
-            if pointer_handler.state.lock().state_changed {
-                let _ = self.services.events.signal_event(event);
+        if let Some(pointer_handler) = unsafe { pointer_handler.as_ref() } {
+            if pointer_handler.state.lock().state_changed
+                && let Err(error) = services.events.signal_event(event)
+            {
+                log::error!("Failed to signal wait_for_input: {:?}", error);
             }
         } else {
             log::error!("absolute_pointer_wait_for_input invoked after pointer dropped.");
@@ -231,7 +238,9 @@ impl AbsolutePointerFfi {
 
 #[cfg(test)]
 mod test {
+    use alloc::rc::Rc;
     use core::{
+        cell::Cell,
         ptr,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -493,7 +502,7 @@ mod test {
         handler.state.lock().state_changed = true;
 
         let ctx = test_context(services, &handler);
-        ctx.signal_if_input_available(test_event(0x1234));
+        AbsolutePointerFfi::signal_if_input_available(ctx.services, ctx.pointer_handler, test_event(0x1234));
         assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
     }
 
@@ -507,7 +516,7 @@ mod test {
         // state_changed defaults to false.
 
         let ctx = test_context(services, &handler);
-        ctx.signal_if_input_available(test_event(0x1234));
+        AbsolutePointerFfi::signal_if_input_available(ctx.services, ctx.pointer_handler, test_event(0x1234));
     }
 
     #[test]
@@ -519,10 +528,52 @@ mod test {
         let mut ctx = test_context(services, &handler);
         ctx.pointer_handler = ptr::null_mut();
         // Should log an error but not panic.
-        ctx.signal_if_input_available(test_event(0x1234));
+        AbsolutePointerFfi::signal_if_input_available(ctx.services, ctx.pointer_handler, test_event(0x1234));
     }
 
     // --- install/uninstall tests ---
+
+    #[test]
+    fn installed_wait_callback_signals_only_when_input_available() {
+        let callback = Rc::new(core::cell::RefCell::new(None));
+        let captured = callback.clone();
+        let signals = Rc::new(Cell::new(0));
+        let counted = signals.clone();
+        let services = mock_services(|protocols, events, timers| {
+            events.expect_create_wait_event().returning_st(move |tpl, notify| {
+                assert_eq!(tpl, Tpl::Notify);
+                *captured.borrow_mut() = Some(notify);
+                Ok(test_event(0x42))
+            });
+            events.expect_signal_event().returning_st(move |event| {
+                assert_eq!(event, test_event(0x42));
+                counted.set(counted.get() + 1);
+                Ok(())
+            });
+            protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            timers.expect_create_timer_event_no_notify().never();
+        });
+        let handler = PointerHidHandler::new_for_test(services);
+        let ctx = AbsolutePointerFfi::install(
+            services,
+            test_handle(0x2),
+            &handler,
+            AbsolutePointerFfi::initialize_mode(&handler),
+        )
+        .unwrap();
+        let mut notify = callback.borrow_mut().take().unwrap();
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 0);
+        handler.state.lock().state_changed = true;
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 1);
+        handler.state.lock().state_changed = false;
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 1);
+        drop(notify);
+        AbsolutePointerFfi::uninstall(services, test_handle(0x2), ctx).unwrap();
+    }
 
     /// Creates a leaked `AbsolutePointerFfi` box, simulating the state after a successful `install`. The caller is
     /// responsible for ensuring the leaked allocation is cleaned up.
@@ -540,10 +591,12 @@ mod test {
     }
 
     #[test]
-    fn install_succeeds_with_unarmed_wait_event() {
-        let services = mock_services(|protocols, _, timers| {
-            timers.expect_create_timer_event_no_notify().returning(|| Ok(test_event(0x42)));
-            // The placeholder wait event must never be armed.
+    fn install_succeeds_with_wait_event() {
+        let services = mock_services(|protocols, events, timers| {
+            events.expect_create_wait_event().returning(|tpl, _| {
+                assert_eq!(tpl, Tpl::Notify);
+                Ok(test_event(0x42))
+            });
             timers.expect_set_timer().never();
             protocols.expect_install_interface().returning(|handle, guid, interface| {
                 assert_eq!(handle, Some(test_handle(0x2)));
@@ -570,8 +623,8 @@ mod test {
 
     #[test]
     fn install_returns_error_on_create_event_failure() {
-        let services = mock_services(|protocols, _, timers| {
-            timers.expect_create_timer_event_no_notify().returning(|| Err(EventError::Internal));
+        let services = mock_services(|protocols, events, _| {
+            events.expect_create_wait_event().returning(|_, _| Err(EventError::Internal));
             protocols.expect_install_interface().never();
         });
 

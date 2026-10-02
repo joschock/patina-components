@@ -42,17 +42,18 @@ impl SimpleTextInExFfi {
     /// [`Self::uninstall`], and the key notify event, which the caller must store in `key_notify_event`.
     ///
     /// `keyboard_handler` is stored in the context but not dereferenced here. It must be the handler's root pointer and
-    /// remain valid until the protocol is uninstalled.
+    /// remain valid until the protocol and its events are released.
     pub(crate) fn install(
         services: HidServices,
         controller: Handle,
         keyboard_handler: *const KeyboardHidHandler,
     ) -> Result<(*mut Self, Event), efi::Status> {
-        // TODO: wait_for_key_ex must be a NOTIFY_WAIT event whose notify function calls `signal_if_key_available`.
-        // Patina EventServices does not yet support creating NOTIFY_WAIT events, so an unarmed timer event with no
-        // notify function is used as a placeholder. Until this is replaced, WaitForEvent on wait_for_key_ex will not
-        // complete.
-        let wait_for_key_event = services.timers.create_timer_event_no_notify().map_err(to_status)?;
+        let wait_for_key_event = services
+            .events
+            .on_wait_event(ServiceTpl::Notify, move |event| {
+                Self::signal_if_key_available(services, keyboard_handler, event);
+            })
+            .map_err(to_status)?;
 
         let ctx = Box::into_raw(Box::new(SimpleTextInExFfi {
             simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
@@ -68,7 +69,9 @@ impl SimpleTextInExFfi {
         }));
 
         let cleanup = |ctx: *mut Self| {
-            let _ = services.events.close_event(wait_for_key_event);
+            if let Err(error) = services.events.close_event(wait_for_key_event) {
+                log::error!("Failed to close wait_for_key_ex after install failure: {:?}", error);
+            }
             // SAFETY: ctx was created by Box::into_raw above and was not published.
             drop(unsafe { Box::from_raw(ctx) });
         };
@@ -76,7 +79,8 @@ impl SimpleTextInExFfi {
         // Key notifies dispatch at TPL_CALLBACK per UEFI spec 2.10 section 12.2.5.
         let ctx_addr = ctx as usize;
         let key_notify_event = match services.events.on_event(ServiceTpl::Callback, move || {
-            // SAFETY: the key notify event is closed before ctx is freed in uninstall.
+            // SAFETY: uninstall closes this event before freeing ctx. On failed installation the event handle
+            // is never published, so no caller can signal it after the context is reclaimed.
             unsafe { Self::process_key_notifies(ctx_addr as *const Self) }
         }) {
             Ok(event) => event,
@@ -94,7 +98,9 @@ impl SimpleTextInExFfi {
         ) {
             Ok(_) => Ok((ctx, key_notify_event)),
             Err(error) => {
-                let _ = services.events.close_event(key_notify_event);
+                if let Err(error) = services.events.close_event(key_notify_event) {
+                    log::error!("Failed to close key_notify_event after install failure: {:?}", error);
+                }
                 cleanup(ctx);
                 Err(to_status(error))
             }
@@ -295,12 +301,10 @@ impl SimpleTextInExFfi {
     /// Signals `event` if a (non-partial) key is available, discarding any leading partial keys.
     ///
     /// This is the notify logic for the wait_for_key_ex event.
-    // TODO: invoke from the wait_for_key_ex NOTIFY_WAIT notify function once Patina EventServices supports it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn signal_if_key_available(&self, event: Event) {
+    fn signal_if_key_available(services: HidServices, keyboard_handler: *const KeyboardHidHandler, event: Event) {
         // SAFETY: the handler outlives the installed protocol (it is leaked if uninstall fails) and is only
         // accessed through shared references; null is handled by the check below.
-        let keyboard_handler = unsafe { self.keyboard_handler.as_ref() };
+        let keyboard_handler = unsafe { keyboard_handler.as_ref() };
         let Some(keyboard_handler) = keyboard_handler else { return };
         let mut state = keyboard_handler.state.lock();
         let kq = &mut state.key_queue;
@@ -309,7 +313,9 @@ impl SimpleTextInExFfi {
                 let _ = kq.pop_key();
                 continue;
             } else {
-                let _ = self.services.events.signal_event(event);
+                if let Err(error) = services.events.signal_event(event) {
+                    log::error!("Failed to signal wait_for_key_ex: {:?}", error);
+                }
                 break;
             }
         }
@@ -348,7 +354,8 @@ impl SimpleTextInExFfi {
 
 #[cfg(test)]
 mod test {
-    use core::ptr;
+    use alloc::rc::Rc;
+    use core::{cell::Cell, ptr};
 
     use alloc::boxed::Box;
     use r_efi::{efi, protocols};
@@ -388,10 +395,54 @@ mod test {
     // --- install/uninstall ---
 
     #[test]
+    fn installed_wait_callback_signals_only_when_key_available() {
+        use hidparser::report_data_types::Usage;
+        let callback = Rc::new(core::cell::RefCell::new(None));
+        let captured = callback.clone();
+        let signals = Rc::new(Cell::new(0));
+        let counted = signals.clone();
+        let services = mock_services(|protocols, events, timers| {
+            events.expect_create_wait_event().returning_st(move |tpl, notify| {
+                assert_eq!(tpl, ServiceTpl::Notify);
+                *captured.borrow_mut() = Some(notify);
+                Ok(test_event(0x42))
+            });
+            events.expect_signal_event().returning_st(move |event| {
+                assert_eq!(event, test_event(0x42));
+                counted.set(counted.get() + 1);
+                Ok(())
+            });
+            protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
+            protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
+            timers.expect_create_timer_event_no_notify().never();
+        });
+        let handler = KeyboardHidHandler::new_for_test(services);
+        handler.set_layout(Some(crate::keyboard::layout::get_default_keyboard_layout()));
+        let (ctx, key_notify_event) = SimpleTextInExFfi::install(services, test_handle(0x2), &handler).unwrap();
+        let mut notify = callback.borrow_mut().take().unwrap();
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 0);
+        handler
+            .state
+            .lock()
+            .key_queue
+            .keystroke(Usage::from(0x00070028u32), super::super::key_queue::KeyAction::KeyDown);
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 1);
+        handler.pop_key();
+        notify(test_event(0x42));
+        assert_eq!(signals.get(), 1);
+        drop(notify);
+        SimpleTextInExFfi::uninstall(services, test_handle(0x2), ctx, Some(key_notify_event)).unwrap();
+    }
+
+    #[test]
     fn install_succeeds() {
         let services = mock_services(|protocols, events, timers| {
-            timers.expect_create_timer_event_no_notify().returning(|| Ok(test_event(0x42)));
-            // The placeholder wait event must never be armed.
+            events.expect_create_wait_event().returning(|tpl, _| {
+                assert_eq!(tpl, ServiceTpl::Notify);
+                Ok(test_event(0x42))
+            });
             timers.expect_set_timer().never();
             events.expect_create_event().returning(|tpl, _| {
                 assert_eq!(tpl, ServiceTpl::Callback);
@@ -417,8 +468,8 @@ mod test {
 
     #[test]
     fn install_returns_error_on_wait_event_failure() {
-        let services = mock_services(|protocols, events, timers| {
-            timers.expect_create_timer_event_no_notify().returning(|| Err(EventError::Internal));
+        let services = mock_services(|protocols, events, _| {
+            events.expect_create_wait_event().returning(|_, _| Err(EventError::Internal));
             events.expect_create_event().never();
             protocols.expect_install_interface().never();
         });
@@ -779,7 +830,7 @@ mod test {
             .key_queue
             .keystroke(Usage::from(0x00070028u32), super::super::key_queue::KeyAction::KeyDown);
         let ctx = test_context(services, &mut handler);
-        ctx.signal_if_key_available(test_event(0x1234));
+        SimpleTextInExFfi::signal_if_key_available(ctx.services, ctx.keyboard_handler, test_event(0x1234));
         assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
     }
 

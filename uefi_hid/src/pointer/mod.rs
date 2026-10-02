@@ -450,7 +450,7 @@ mod test {
         let services = crate::test_stubs::mock_services(|protocols, events, timers| {
             protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
             protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
-            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+            timers.expect_create_timer_event_no_notify().never();
             events.expect_close_event().returning(move |_| {
                 closed_for_mock.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -470,7 +470,7 @@ mod test {
             protocols.expect_uninstall_interface().returning(|_, _, _| {
                 Err(patina::component::service::uefi_services::protocol::ProtocolError::AccessDenied)
             });
-            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+            timers.expect_create_timer_event_no_notify().never();
         });
         let receiver = receiver_for_test(services);
         let root = receiver.root;
@@ -489,7 +489,7 @@ mod test {
         let services = crate::test_stubs::mock_services(|protocols, events, timers| {
             protocols.expect_install_interface().returning(|handle, _, _| Ok(handle.unwrap()));
             protocols.expect_uninstall_interface().returning(|_, _, _| Ok(()));
-            timers.expect_create_timer_event_no_notify().returning(|| Ok(crate::test_stubs::test_event(0x42)));
+            timers.expect_create_timer_event_no_notify().never();
             events
                 .expect_close_event()
                 .returning(|_| Err(patina::component::service::uefi_services::event::EventError::InvalidParameter));

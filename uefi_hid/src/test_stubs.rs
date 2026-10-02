@@ -108,6 +108,7 @@ pub fn mock_services(
     setup(&mut protocols, &mut events, &mut timers);
 
     events.expect_create_event().returning(|_, _| Ok(test_event(0xE0E)));
+    events.expect_create_wait_event().returning(|_, _| Ok(test_event(0xE4E)));
     events.expect_create_event_for_group().returning(|_, _, _| Ok(test_event(0xE1E)));
     events.expect_signal_event().returning(|_| Ok(()));
     events.expect_check_event().returning(|_| Ok(false));
