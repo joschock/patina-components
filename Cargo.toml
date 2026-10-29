@@ -16,14 +16,14 @@ log = { version = "0.4", default-features = false }
 mockall = { version = "0.13.0" }
 num_enum = { version = "0.7", default-features = false }
 # git path is a temporary placeholder until the appropriate protocol branches are checked in upstream.
-patina = { git = "https://github.com/joschock/patina", branch = "usb_hid_protocol_defs" }
+patina = { version = "24" }
 r-efi = { version = "7", default-features = false }
 scroll = { version = "0.13", default-features = false, features = ["derive"] }
 
 # Local patina tree override for development. Build is expected to fail until
 # integration code is updated to match the local tree.
-[patch."https://github.com/joschock/patina"]
-patina = { path = "/home/schock/patina/sdk/patina" }
+[patch.crates-io]
+patina = { git = "https://github.com/OpenDevicePartnership/patina.git", branch = "feature/uefi_services" }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
