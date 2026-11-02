@@ -246,7 +246,7 @@ impl UefiHidIo {
         // Register the HidIo callback. This also configures HidIo to start sending reports.
         // SAFETY: hid_io points to a valid protocol; callback and context are valid.
         match unsafe {
-            (hid_io_ref.register_report_callback)(hid_io, Self::report_callback, report_queue.as_ptr().cast())
+            (hid_io_ref.register_report_callback)(hid_io, Some(Self::report_callback), report_queue.as_ptr().cast())
         } {
             efi::Status::SUCCESS => (),
             err => {
@@ -302,7 +302,7 @@ impl Drop for UefiHidIo {
         let hid_io_protocol = unsafe { &*self.hid_io };
         // SAFETY: hid_io points to a valid protocol opened BY_DRIVER.
         let unregister_status =
-            unsafe { (hid_io_protocol.unregister_report_callback)(self.hid_io, Self::report_callback) };
+            unsafe { (hid_io_protocol.unregister_report_callback)(self.hid_io, Some(Self::report_callback)) };
 
         // SAFETY: report_queue is valid until freed below; only shared references are formed.
         let report_queue = unsafe { self.report_queue.as_ref() };
@@ -541,7 +541,7 @@ mod test {
 
         extern "efiapi" fn register_cb(
             _this: *const HidIoProtocol,
-            _callback: HidIoReportCallback,
+            _callback: Option<HidIoReportCallback>,
             context: *mut c_void,
         ) -> efi::Status {
             CALLBACK_CONTEXT.store(context, Ordering::SeqCst);
@@ -641,7 +641,7 @@ mod test {
     fn new_cleans_up_on_register_callback_failure() {
         extern "efiapi" fn failing_register(
             _this: *const HidIoProtocol,
-            _callback: HidIoReportCallback,
+            _callback: Option<HidIoReportCallback>,
             _context: *mut c_void,
         ) -> efi::Status {
             efi::Status::DEVICE_ERROR

@@ -168,10 +168,14 @@ unsafe extern "efiapi" fn hid_set_report(
 /// registration (until the callback is unregistered).
 unsafe extern "efiapi" fn hid_register_report_callback(
     this: *const HidIoProtocol,
-    callback: HidIoReportCallback,
+    callback: Option<HidIoReportCallback>,
     context: *mut c_void,
 ) -> efi::Status {
     if this.is_null() {
+        return efi::Status::INVALID_PARAMETER;
+    }
+
+    if callback.is_none() {
         return efi::Status::INVALID_PARAMETER;
     }
 
@@ -182,7 +186,7 @@ unsafe extern "efiapi" fn hid_register_report_callback(
         return efi::Status::ALREADY_STARTED;
     }
 
-    device.report_callback.callback = Some(callback);
+    device.report_callback.callback = callback;
     device.report_callback.context = context;
 
     match interrupt_transfers::initiate_async_interrupt_input_transfers(device) {
@@ -202,19 +206,26 @@ unsafe extern "efiapi" fn hid_register_report_callback(
 /// [`UsbHidDevice`].
 unsafe extern "efiapi" fn hid_unregister_report_callback(
     this: *const HidIoProtocol,
-    callback: HidIoReportCallback,
+    callback: Option<HidIoReportCallback>,
 ) -> efi::Status {
     if this.is_null() {
         return efi::Status::INVALID_PARAMETER;
     }
 
+    let Some(callback) = callback else {
+        return efi::Status::INVALID_PARAMETER;
+    };
+
     // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
     let device = unsafe { &mut *UsbHidDevice::from_hid_io_protocol(this) };
 
+    let Some(registered) = device.report_callback.callback else {
+        return efi::Status::NOT_STARTED;
+    };
+
     // Verify the callback matches the registered one.
-    match device.report_callback.callback {
-        Some(registered) if core::ptr::fn_addr_eq(registered, callback) => {}
-        _ => return efi::Status::NOT_STARTED,
+    if !core::ptr::fn_addr_eq(registered, callback) {
+        return efi::Status::NOT_STARTED;
     }
 
     match interrupt_transfers::shutdown_async_interrupt_input_transfers(device) {
@@ -674,7 +685,8 @@ mod test {
     #[test]
     fn register_callback_null_this_returns_invalid_parameter() {
         // SAFETY: testing null this handling.
-        let status = unsafe { hid_register_report_callback(core::ptr::null(), test_callback, core::ptr::null_mut()) };
+        let status =
+            unsafe { hid_register_report_callback(core::ptr::null(), Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
     }
 
@@ -684,7 +696,7 @@ mod test {
         let device = make_device(&mock_usb, vec![0x05]);
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert!(device.report_callback.callback.is_some());
         core::mem::forget(device);
@@ -697,11 +709,11 @@ mod test {
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // Register first callback.
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
         // Second registration should fail.
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::ALREADY_STARTED);
         core::mem::forget(device);
     }
@@ -712,7 +724,7 @@ mod test {
         let device = make_device(&mock_usb, vec![0x05]);
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
         assert!(device.report_callback.callback.is_none());
         core::mem::forget(device);
@@ -723,7 +735,7 @@ mod test {
     #[test]
     fn unregister_callback_null_this_returns_invalid_parameter() {
         // SAFETY: testing null this handling.
-        let status = unsafe { hid_unregister_report_callback(core::ptr::null(), test_callback) };
+        let status = unsafe { hid_unregister_report_callback(core::ptr::null(), Some(test_callback)) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
     }
 
@@ -733,7 +745,7 @@ mod test {
         let device = make_device(&mock_usb, vec![0x05]);
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // SAFETY: device is a valid UsbHidDevice; no callback registered.
-        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, test_callback) };
+        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(test_callback)) };
         assert_eq!(status, efi::Status::NOT_STARTED);
         core::mem::forget(device);
     }
@@ -745,10 +757,10 @@ mod test {
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // Register one callback, then try to unregister a different one.
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, other_callback) };
+        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(other_callback)) };
         assert_eq!(status, efi::Status::NOT_STARTED);
         assert!(device.report_callback.callback.is_some());
         core::mem::forget(device);
@@ -760,10 +772,10 @@ mod test {
         let device = make_device(&mock_usb, vec![0x05]);
         let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_register_report_callback(hid_io_ptr, test_callback, core::ptr::null_mut()) };
+        let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
         // SAFETY: device is a valid UsbHidDevice.
-        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, test_callback) };
+        let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(test_callback)) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert!(device.report_callback.callback.is_none());
         core::mem::forget(device);

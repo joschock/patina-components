@@ -47,14 +47,14 @@ pub fn hid_io_stub() -> &'static mut HidIoProtocol {
     }
     unsafe extern "efiapi" fn register_report_callback(
         _this: *const HidIoProtocol,
-        _callback: HidIoReportCallback,
+        _callback: Option<HidIoReportCallback>,
         _context: *mut c_void,
     ) -> efi::Status {
         efi::Status::SUCCESS
     }
     unsafe extern "efiapi" fn unregister_report_callback(
         _this: *const HidIoProtocol,
-        _callback: HidIoReportCallback,
+        _callback: Option<HidIoReportCallback>,
     ) -> efi::Status {
         efi::Status::SUCCESS
     }
