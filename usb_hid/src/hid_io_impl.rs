@@ -105,14 +105,15 @@ unsafe extern "efiapi" fn hid_get_report(
         return efi::Status::INVALID_PARAMETER;
     }
 
+    // SAFETY: the caller provides a writable buffer of report_buffer_size bytes, checked non-null above.
+    let report = unsafe { core::slice::from_raw_parts_mut(report_buffer.cast::<u8>(), report_buffer_size) };
     let operation =
         |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| match control_transfers::usb_get_report_request(
             usb_io,
             device.descriptors.interface_descriptor.interface_number,
             report_id,
-            report_type as u8,
-            report_buffer_size as u16,
-            report_buffer as *mut u8,
+            report_type,
+            report,
         ) {
             Ok(()) => efi::Status::SUCCESS,
             Err(status) => status,
@@ -144,14 +145,15 @@ unsafe extern "efiapi" fn hid_set_report(
         return efi::Status::INVALID_PARAMETER;
     }
 
+    // SAFETY: the caller provides a readable buffer of report_buffer_size bytes, checked non-null above.
+    let report = unsafe { core::slice::from_raw_parts(report_buffer.cast::<u8>(), report_buffer_size) };
     let operation =
         |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| match control_transfers::usb_set_report_request(
             usb_io,
             device.descriptors.interface_descriptor.interface_number,
             report_id,
-            report_type as u8,
-            report_buffer_size as u16,
-            report_buffer as *const u8,
+            report_type,
+            report,
         ) {
             Ok(()) => efi::Status::SUCCESS,
             Err(status) => status,

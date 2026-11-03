@@ -8,6 +8,7 @@
 //!
 use core::ffi::c_void;
 
+use patina::vendor_protocols::hid_io::HidReportType;
 use r_efi::{efi, efi::protocols::usb_io};
 
 use crate::usb_hid_defs::*;
@@ -49,10 +50,10 @@ pub fn usb_get_report_request(
     usb_io_protocol: &usb_io::Protocol,
     interface_number: u8,
     report_id: u8,
-    report_type: u8,
-    report_len: u16,
-    report: *mut u8,
+    report_type: HidReportType,
+    report: &mut [u8],
 ) -> Result<(), efi::Status> {
+    let report_len = u16::try_from(report.len()).map_err(|_| efi::Status::INVALID_PARAMETER)?;
     let mut request = usb_io::DeviceRequest {
         request_type: USB_REQ_TYPE_CLASS_INTERFACE_IN,
         request: USB_HID_GET_REPORT_REQUEST,
@@ -68,8 +69,8 @@ pub fn usb_get_report_request(
             &mut request,
             usb_io::DATA_IN,
             USB_TRANSFER_TIMEOUT_MS,
-            report as *mut c_void,
-            report_len as usize,
+            report.as_mut_ptr().cast(),
+            report.len(),
             &mut transfer_status,
         )
     };
@@ -84,10 +85,10 @@ pub fn usb_set_report_request(
     usb_io_protocol: &usb_io::Protocol,
     interface_number: u8,
     report_id: u8,
-    report_type: u8,
-    report_len: u16,
-    report: *const u8,
+    report_type: HidReportType,
+    report: &[u8],
 ) -> Result<(), efi::Status> {
+    let report_len = u16::try_from(report.len()).map_err(|_| efi::Status::INVALID_PARAMETER)?;
     let mut request = usb_io::DeviceRequest {
         request_type: USB_REQ_TYPE_CLASS_INTERFACE_OUT,
         request: USB_HID_SET_REPORT_REQUEST,
@@ -103,8 +104,8 @@ pub fn usb_set_report_request(
             &mut request,
             usb_io::DATA_OUT,
             USB_TRANSFER_TIMEOUT_MS,
-            report as *mut c_void,
-            report_len as usize,
+            report.as_ptr() as *mut c_void,
+            report.len(),
             &mut transfer_status,
         )
     };
@@ -146,9 +147,9 @@ pub fn usb_clear_endpoint_halt(usb_io_protocol: &usb_io::Protocol, endpoint_addr
 pub fn usb_get_report_descriptor(
     usb_io_protocol: &usb_io::Protocol,
     interface_number: u8,
-    descriptor_length: u16,
-    descriptor_buffer: *mut u8,
+    descriptor_buffer: &mut [u8],
 ) -> Result<(), efi::Status> {
+    let descriptor_length = u16::try_from(descriptor_buffer.len()).map_err(|_| efi::Status::INVALID_PARAMETER)?;
     let mut request = usb_io::DeviceRequest {
         request_type: USB_REQ_TYPE_STANDARD_DEVICE_IN | 0x01, // Interface recipient
         request: USB_REQ_GET_DESCRIPTOR,
@@ -164,8 +165,8 @@ pub fn usb_get_report_descriptor(
             &mut request,
             usb_io::DATA_IN,
             USB_TRANSFER_TIMEOUT_MS,
-            descriptor_buffer as *mut c_void,
-            descriptor_length as usize,
+            descriptor_buffer.as_mut_ptr().cast(),
+            descriptor_buffer.len(),
             &mut transfer_status,
         )
     };
@@ -243,6 +244,39 @@ mod test {
         MockUsbIo { protocol, status, captured: Cell::new(CapturedRequest::default()) }
     }
 
+    #[test]
+    fn buffer_transfers_reject_lengths_exceeding_usb_limit() {
+        let protocol = crate::test_stubs::usb_io_stub();
+        let mut buffer = alloc::vec![0u8; u16::MAX as usize + 1];
+        assert_eq!(
+            usb_get_report_request(&protocol, 0, 0, HidReportType::InputReport, &mut buffer),
+            Err(efi::Status::INVALID_PARAMETER),
+        );
+        assert_eq!(
+            usb_set_report_request(&protocol, 0, 0, HidReportType::OutputReport, &buffer),
+            Err(efi::Status::INVALID_PARAMETER),
+        );
+        assert_eq!(usb_get_report_descriptor(&protocol, 0, &mut buffer), Err(efi::Status::INVALID_PARAMETER),);
+    }
+
+    #[test]
+    fn buffer_transfers_accept_maximum_usb_length() {
+        let mock = make_mock(efi::Status::SUCCESS);
+        let mut buffer = alloc::vec![0u8; u16::MAX as usize];
+        assert!(usb_get_report_request(&mock.protocol, 0, 0, HidReportType::Feature, &mut buffer).is_ok());
+        assert_eq!(mock.captured.get().length, u16::MAX);
+        assert_eq!(mock.captured.get().data_length, buffer.len());
+        assert_eq!(mock.captured.get().value, (HidReportType::Feature as u16) << 8);
+
+        assert!(usb_set_report_request(&mock.protocol, 0, 0, HidReportType::Feature, &buffer).is_ok());
+        assert_eq!(mock.captured.get().length, u16::MAX);
+        assert_eq!(mock.captured.get().data_length, buffer.len());
+
+        assert!(usb_get_report_descriptor(&mock.protocol, 0, &mut buffer).is_ok());
+        assert_eq!(mock.captured.get().length, u16::MAX);
+        assert_eq!(mock.captured.get().data_length, buffer.len());
+    }
+
     // ---- set_protocol_request tests ----
 
     #[test]
@@ -271,7 +305,7 @@ mod test {
     fn get_report_request_builds_correct_request() {
         let mock = make_mock(efi::Status::SUCCESS);
         let mut buffer = [0u8; 16];
-        assert!(usb_get_report_request(&mock.protocol, 1, 0x03, 0x01, 16, buffer.as_mut_ptr()).is_ok());
+        assert!(usb_get_report_request(&mock.protocol, 1, 0x03, HidReportType::InputReport, &mut buffer).is_ok());
         let cap = mock.captured.get();
         assert_eq!(cap.request_type, USB_REQ_TYPE_CLASS_INTERFACE_IN);
         assert_eq!(cap.request, USB_HID_GET_REPORT_REQUEST);
@@ -287,7 +321,7 @@ mod test {
         let mock = make_mock(efi::Status::DEVICE_ERROR);
         let mut buffer = [0u8; 8];
         assert_eq!(
-            usb_get_report_request(&mock.protocol, 0, 0, 0x01, 8, buffer.as_mut_ptr()),
+            usb_get_report_request(&mock.protocol, 0, 0, HidReportType::InputReport, &mut buffer),
             Err(efi::Status::DEVICE_ERROR),
         );
     }
@@ -298,7 +332,7 @@ mod test {
     fn set_report_request_builds_correct_request() {
         let mock = make_mock(efi::Status::SUCCESS);
         let report = [0xAAu8; 4];
-        assert!(usb_set_report_request(&mock.protocol, 0, 0x01, 0x02, 4, report.as_ptr()).is_ok());
+        assert!(usb_set_report_request(&mock.protocol, 0, 0x01, HidReportType::OutputReport, &report).is_ok());
         let cap = mock.captured.get();
         assert_eq!(cap.request_type, USB_REQ_TYPE_CLASS_INTERFACE_OUT);
         assert_eq!(cap.request, USB_HID_SET_REPORT_REQUEST);
@@ -314,7 +348,7 @@ mod test {
         let mock = make_mock(efi::Status::DEVICE_ERROR);
         let report = [0u8; 4];
         assert_eq!(
-            usb_set_report_request(&mock.protocol, 0, 0, 0x02, 4, report.as_ptr()),
+            usb_set_report_request(&mock.protocol, 0, 0, HidReportType::OutputReport, &report),
             Err(efi::Status::DEVICE_ERROR),
         );
     }
@@ -347,7 +381,7 @@ mod test {
     fn get_report_descriptor_builds_correct_request() {
         let mock = make_mock(efi::Status::SUCCESS);
         let mut buffer = [0u8; 64];
-        assert!(usb_get_report_descriptor(&mock.protocol, 0, 64, buffer.as_mut_ptr()).is_ok());
+        assert!(usb_get_report_descriptor(&mock.protocol, 0, &mut buffer).is_ok());
         let cap = mock.captured.get();
         assert_eq!(cap.request_type, USB_REQ_TYPE_STANDARD_DEVICE_IN | 0x01);
         assert_eq!(cap.request, USB_REQ_GET_DESCRIPTOR);
@@ -362,7 +396,7 @@ mod test {
     fn get_report_descriptor_uses_interface_number_as_index() {
         let mock = make_mock(efi::Status::SUCCESS);
         let mut buffer = [0u8; 32];
-        assert!(usb_get_report_descriptor(&mock.protocol, 3, 32, buffer.as_mut_ptr()).is_ok());
+        assert!(usb_get_report_descriptor(&mock.protocol, 3, &mut buffer).is_ok());
         assert_eq!(mock.captured.get().index, 3);
     }
 
@@ -370,9 +404,6 @@ mod test {
     fn get_report_descriptor_returns_error_on_failure() {
         let mock = make_mock(efi::Status::DEVICE_ERROR);
         let mut buffer = [0u8; 64];
-        assert_eq!(
-            usb_get_report_descriptor(&mock.protocol, 0, 64, buffer.as_mut_ptr()),
-            Err(efi::Status::DEVICE_ERROR),
-        );
+        assert_eq!(usb_get_report_descriptor(&mock.protocol, 0, &mut buffer), Err(efi::Status::DEVICE_ERROR),);
     }
 }

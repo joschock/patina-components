@@ -112,12 +112,7 @@ fn read_report_descriptor(
 
     let mut buffer = vec![0u8; descriptor_length];
 
-    control_transfers::usb_get_report_descriptor(
-        usb_io_protocol,
-        interface_descriptor.interface_number,
-        descriptor_length as u16,
-        buffer.as_mut_ptr(),
-    )?;
+    control_transfers::usb_get_report_descriptor(usb_io_protocol, interface_descriptor.interface_number, &mut buffer)?;
 
     Ok(buffer)
 }
