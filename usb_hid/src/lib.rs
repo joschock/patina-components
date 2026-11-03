@@ -31,8 +31,7 @@ use patina::{
         service::{
             Service,
             uefi_services::{
-                event::EventServices,
-                protocol::{ProtocolServices, ProtocolServicesExt},
+                controller_driver::install_controller_driver, event::EventServices, protocol::ProtocolServices,
                 timer_event::TimerEventServices,
             },
         },
@@ -54,33 +53,19 @@ impl UsbHidComponent {
         events: Service<dyn EventServices>,
         timers: Service<dyn TimerEventServices>,
     ) -> Result<()> {
-        install_usb_hid_driver_binding(protocols, events, timers)
+        install_controller_driver(protocols, driver::UsbHidDriver::new(protocols, events, timers))?;
+        Ok(())
     }
-}
-
-/// Installs the USB HID driver binding.
-///
-/// Separated from the component entry point to allow testing with mock services.
-fn install_usb_hid_driver_binding(
-    protocols: Service<dyn ProtocolServices>,
-    events: Service<dyn EventServices>,
-    timers: Service<dyn TimerEventServices>,
-) -> Result<()> {
-    protocols.install_driver_binding(driver::UsbHidDriver::new(protocols, events, timers))?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use patina::{
-        component::service::uefi_services::{
-            event::MockEventServices,
-            handle::Handle,
-            protocol::{MockProtocolServices, ProtocolError},
-            timer_event::MockTimerEventServices,
-        },
-        error::EfiError,
+    use patina::component::service::uefi_services::{
+        event::MockEventServices,
+        handle::Handle,
+        protocol::{MockProtocolServices, ProtocolError},
+        timer_event::MockTimerEventServices,
     };
     use r_efi::efi;
 
@@ -102,8 +87,9 @@ mod test {
             .times(1)
             .returning(|handle, _, _| Ok(handle.unwrap()));
         let (events, timers) = event_and_timer_mocks();
+        let protocols: Service<dyn ProtocolServices> = Service::mock(Box::new(protocols));
 
-        install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers)
+        install_controller_driver(protocols, driver::UsbHidDriver::new(protocols, events, timers))
             .expect("install should succeed");
     }
 
@@ -112,16 +98,18 @@ mod test {
         let mut protocols = MockProtocolServices::new();
         protocols.expect_register_agent().returning(|| Err(ProtocolError::Internal));
         let (events, timers) = event_and_timer_mocks();
-        assert!(install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers).is_err());
+        let protocols: Service<dyn ProtocolServices> = Service::mock(Box::new(protocols));
+        assert!(install_controller_driver(protocols, driver::UsbHidDriver::new(protocols, events, timers)).is_err());
 
         let mut protocols = MockProtocolServices::new();
         protocols.expect_register_agent().returning(|| Ok(Handle::from_raw(0x5678 as efi::Handle).unwrap()));
         protocols.expect_image_handle().times(1).returning(|| Handle::from_raw(0x1234 as efi::Handle).unwrap());
         protocols.expect_install_interface().returning(|_, _, _| Err(ProtocolError::OutOfResources));
         let (events, timers) = event_and_timer_mocks();
-        assert_eq!(
-            install_usb_hid_driver_binding(Service::mock(Box::new(protocols)), events, timers),
-            Err(EfiError::OutOfResources)
-        );
+        let protocols: Service<dyn ProtocolServices> = Service::mock(Box::new(protocols));
+        assert!(matches!(
+            install_controller_driver(protocols, driver::UsbHidDriver::new(protocols, events, timers)),
+            Err(ProtocolError::OutOfResources)
+        ));
     }
 }

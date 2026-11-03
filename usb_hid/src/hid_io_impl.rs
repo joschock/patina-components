@@ -1,6 +1,6 @@
 //! HidIoProtocol function pointer implementations for USB HID devices.
 //!
-//! Each function recovers the `UsbHidDevice` from the protocol pointer,
+//! Each function accesses Patina-managed device state through the installed interface,
 //! then delegates to USB IO operations.
 //!
 //! ## License
@@ -11,11 +11,15 @@
 //!
 use core::ffi::c_void;
 
-use r_efi::efi;
+use r_efi::efi::{self, protocols::usb_io};
 
 use patina::vendor_protocols::hid_io::{HidIoProtocol, HidIoReportCallback, HidReportType};
 
-use crate::{control_transfers, device::UsbHidDevice, interrupt_transfers};
+use crate::{
+    control_transfers,
+    device::{HidIoInterface, UsbHidDevice},
+    interrupt_transfers,
+};
 
 /// Creates a new `HidIoProtocol` populated with this module's function pointers.
 pub fn new_hid_io_protocol() -> HidIoProtocol {
@@ -32,8 +36,8 @@ pub fn new_hid_io_protocol() -> HidIoProtocol {
 ///
 /// # Safety
 ///
-/// `this` must point to the `hid_io` field of a valid, heap-allocated
-/// [`UsbHidDevice`]. `report_descriptor_size` must be a valid pointer.
+/// `this` must point to the `hid_io` field of a live [`HidIoInterface`].
+/// `report_descriptor_size` must be a valid pointer.
 /// If the buffer is large enough, `report_descriptor_buffer` must be valid
 /// for `*report_descriptor_size` bytes.
 unsafe extern "efiapi" fn hid_get_report_descriptor(
@@ -45,44 +49,45 @@ unsafe extern "efiapi" fn hid_get_report_descriptor(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
-    let device = unsafe { &mut *UsbHidDevice::from_hid_io_protocol(this) };
+    let operation = |device: &mut UsbHidDevice, _usb_io: &usb_io::Protocol| {
+        if device.descriptors.report_descriptor.is_empty() {
+            return efi::Status::NOT_FOUND;
+        }
 
-    if device.descriptors.report_descriptor.is_empty() {
-        return efi::Status::NOT_FOUND;
-    }
-
-    // SAFETY: report_descriptor_size is checked non-null above.
-    let requested_size = unsafe { *report_descriptor_size };
-    if requested_size < device.descriptors.report_descriptor.len() {
         // SAFETY: report_descriptor_size is checked non-null above.
-        unsafe { *report_descriptor_size = device.descriptors.report_descriptor.len() };
-        return efi::Status::BUFFER_TOO_SMALL;
-    }
+        let requested_size = unsafe { *report_descriptor_size };
+        if requested_size < device.descriptors.report_descriptor.len() {
+            // SAFETY: report_descriptor_size is checked non-null above.
+            unsafe { *report_descriptor_size = device.descriptors.report_descriptor.len() };
+            return efi::Status::BUFFER_TOO_SMALL;
+        }
 
-    if report_descriptor_buffer.is_null() {
-        return efi::Status::INVALID_PARAMETER;
-    }
+        if report_descriptor_buffer.is_null() {
+            return efi::Status::INVALID_PARAMETER;
+        }
 
-    // SAFETY: Both pointers are valid for report_descriptor.len() bytes.
-    unsafe {
-        *report_descriptor_size = device.descriptors.report_descriptor.len();
-        core::ptr::copy_nonoverlapping(
-            device.descriptors.report_descriptor.as_ptr(),
-            report_descriptor_buffer as *mut u8,
-            device.descriptors.report_descriptor.len(),
-        );
-    }
+        // SAFETY: Both pointers are valid for report_descriptor.len() bytes.
+        unsafe {
+            *report_descriptor_size = device.descriptors.report_descriptor.len();
+            core::ptr::copy_nonoverlapping(
+                device.descriptors.report_descriptor.as_ptr(),
+                report_descriptor_buffer as *mut u8,
+                device.descriptors.report_descriptor.len(),
+            );
+        }
 
-    efi::Status::SUCCESS
+        efi::Status::SUCCESS
+    };
+    // SAFETY: this points to a live HidIoInterface, as required by the caller contract.
+    unsafe { HidIoInterface::with_device(this, operation) }
 }
 
 /// Retrieves a single report from the device via USB GET_REPORT request.
 ///
 /// # Safety
 ///
-/// `this` must point to the `hid_io` field of a valid, heap-allocated
-/// [`UsbHidDevice`]. `report_buffer` must be valid for `report_buffer_size`
+/// `this` must point to the `hid_io` field of a live [`HidIoInterface`].
+/// `report_buffer` must be valid for `report_buffer_size`
 /// bytes.
 unsafe extern "efiapi" fn hid_get_report(
     this: *const HidIoProtocol,
@@ -100,30 +105,28 @@ unsafe extern "efiapi" fn hid_get_report(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
-    let device = unsafe { &*UsbHidDevice::from_hid_io_protocol(this) };
-    // SAFETY: usb_io is valid for the device's lifetime.
-    let usb_io = unsafe { &*device.usb_io };
-
-    match control_transfers::usb_get_report_request(
-        usb_io,
-        device.descriptors.interface_descriptor.interface_number,
-        report_id,
-        report_type as u8,
-        report_buffer_size as u16,
-        report_buffer as *mut u8,
-    ) {
-        Ok(()) => efi::Status::SUCCESS,
-        Err(status) => status,
-    }
+    let operation =
+        |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| match control_transfers::usb_get_report_request(
+            usb_io,
+            device.descriptors.interface_descriptor.interface_number,
+            report_id,
+            report_type as u8,
+            report_buffer_size as u16,
+            report_buffer as *mut u8,
+        ) {
+            Ok(()) => efi::Status::SUCCESS,
+            Err(status) => status,
+        };
+    // SAFETY: this points to a live HidIoInterface, as required by the caller contract.
+    unsafe { HidIoInterface::with_device(this, operation) }
 }
 
 /// Sends a single report to the device via USB SET_REPORT request.
 ///
 /// # Safety
 ///
-/// `this` must point to the `hid_io` field of a valid, heap-allocated
-/// [`UsbHidDevice`]. `report_buffer` must be valid for `report_buffer_size`
+/// `this` must point to the `hid_io` field of a live [`HidIoInterface`].
+/// `report_buffer` must be valid for `report_buffer_size`
 /// bytes.
 unsafe extern "efiapi" fn hid_set_report(
     this: *const HidIoProtocol,
@@ -141,30 +144,28 @@ unsafe extern "efiapi" fn hid_set_report(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
-    let device = unsafe { &*UsbHidDevice::from_hid_io_protocol(this) };
-    // SAFETY: usb_io is valid for the device's lifetime.
-    let usb_io = unsafe { &*device.usb_io };
-
-    match control_transfers::usb_set_report_request(
-        usb_io,
-        device.descriptors.interface_descriptor.interface_number,
-        report_id,
-        report_type as u8,
-        report_buffer_size as u16,
-        report_buffer as *const u8,
-    ) {
-        Ok(()) => efi::Status::SUCCESS,
-        Err(status) => status,
-    }
+    let operation =
+        |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| match control_transfers::usb_set_report_request(
+            usb_io,
+            device.descriptors.interface_descriptor.interface_number,
+            report_id,
+            report_type as u8,
+            report_buffer_size as u16,
+            report_buffer as *const u8,
+        ) {
+            Ok(()) => efi::Status::SUCCESS,
+            Err(status) => status,
+        };
+    // SAFETY: this points to a live HidIoInterface, as required by the caller contract.
+    unsafe { HidIoInterface::with_device(this, operation) }
 }
 
 /// Registers a callback function to receive asynchronous input reports.
 ///
 /// # Safety
 ///
-/// `this` must point to the `hid_io` field of a valid, heap-allocated
-/// [`UsbHidDevice`]. `context` must remain valid for the lifetime of the
+/// `this` must point to the `hid_io` field of a live [`HidIoInterface`].
+/// `context` must remain valid for the lifetime of the
 /// registration (until the callback is unregistered).
 unsafe extern "efiapi" fn hid_register_report_callback(
     this: *const HidIoProtocol,
@@ -179,31 +180,31 @@ unsafe extern "efiapi" fn hid_register_report_callback(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
-    let device = unsafe { &mut *UsbHidDevice::from_hid_io_protocol(this) };
-
-    if device.report_callback.callback.is_some() {
-        return efi::Status::ALREADY_STARTED;
-    }
-
-    device.report_callback.callback = callback;
-    device.report_callback.context = context;
-
-    match interrupt_transfers::initiate_async_interrupt_input_transfers(device) {
-        Ok(()) => efi::Status::SUCCESS,
-        Err(status) => {
-            device.report_callback.callback = None;
-            status
+    let operation = |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| {
+        if device.report_callback.callback.is_some() {
+            return efi::Status::ALREADY_STARTED;
         }
-    }
+
+        device.report_callback.callback = callback;
+        device.report_callback.context = context;
+
+        match interrupt_transfers::initiate_async_interrupt_input_transfers(device, usb_io) {
+            Ok(()) => efi::Status::SUCCESS,
+            Err(status) => {
+                device.report_callback.callback = None;
+                status
+            }
+        }
+    };
+    // SAFETY: this points to a live HidIoInterface, as required by the caller contract.
+    unsafe { HidIoInterface::with_device(this, operation) }
 }
 
 /// Unregisters a previously registered callback function.
 ///
 /// # Safety
 ///
-/// `this` must point to the `hid_io` field of a valid, heap-allocated
-/// [`UsbHidDevice`].
+/// `this` must point to the `hid_io` field of a live [`HidIoInterface`].
 unsafe extern "efiapi" fn hid_unregister_report_callback(
     this: *const HidIoProtocol,
     callback: Option<HidIoReportCallback>,
@@ -216,28 +217,29 @@ unsafe extern "efiapi" fn hid_unregister_report_callback(
         return efi::Status::INVALID_PARAMETER;
     };
 
-    // SAFETY: this points to the hid_io field of a valid UsbHidDevice.
-    let device = unsafe { &mut *UsbHidDevice::from_hid_io_protocol(this) };
+    let operation = |device: &mut UsbHidDevice, usb_io: &usb_io::Protocol| {
+        let Some(registered) = device.report_callback.callback else {
+            return efi::Status::NOT_STARTED;
+        };
 
-    let Some(registered) = device.report_callback.callback else {
-        return efi::Status::NOT_STARTED;
-    };
-
-    // Verify the callback matches the registered one.
-    if !core::ptr::fn_addr_eq(registered, callback) {
-        return efi::Status::NOT_STARTED;
-    }
-
-    match interrupt_transfers::shutdown_async_interrupt_input_transfers(device) {
-        Ok(()) => {}
-        Err(status) => {
-            log::error!("USB HID: error shutting down transfers during unregister: {status:x?}");
+        // Verify the callback matches the registered one.
+        if !core::ptr::fn_addr_eq(registered, callback) {
+            return efi::Status::NOT_STARTED;
         }
-    }
 
-    device.report_callback.callback = None;
+        match interrupt_transfers::shutdown_async_interrupt_input_transfers(device, usb_io) {
+            Ok(()) => {}
+            Err(status) => {
+                log::error!("USB HID: error shutting down transfers during unregister: {status:x?}");
+            }
+        }
 
-    efi::Status::SUCCESS
+        device.report_callback.callback = None;
+
+        efi::Status::SUCCESS
+    };
+    // SAFETY: this points to a live HidIoInterface, as required by the caller contract.
+    unsafe { HidIoInterface::with_device(this, operation) }
 }
 
 #[cfg(test)]
@@ -249,7 +251,7 @@ mod test {
     use r_efi::efi::protocols::usb_io;
 
     use crate::{
-        device::{ReportCallbackState, UsbHidDescriptors, UsbHidDevice},
+        device::{ReportCallbackState, UsbHidDescriptors},
         usb_hid_defs::{empty_usb_endpoint_descriptor, empty_usb_interface_descriptor},
     };
 
@@ -328,11 +330,10 @@ mod test {
 
     // ---- Test device builder ----
 
-    fn make_device(usb_io: &MockUsbIo, report_descriptor: Vec<u8>) -> Box<UsbHidDevice> {
-        Box::new(UsbHidDevice {
-            hid_io: new_hid_io_protocol(),
-            usb_io: &usb_io.protocol as *const usb_io::Protocol as *mut usb_io::Protocol,
-            descriptors: UsbHidDescriptors {
+    fn make_device(usb_io: &MockUsbIo, report_descriptor: Vec<u8>) -> crate::test_stubs::TestDevice<'_> {
+        let device = crate::test_stubs::TestDevice::new(&usb_io.protocol);
+        device.with(|device| {
+            device.descriptors = UsbHidDescriptors {
                 interface_descriptor: empty_usb_interface_descriptor(),
                 int_in_endpoint_descriptor: usb_io::EndpointDescriptor {
                     endpoint_address: 0x81,
@@ -341,11 +342,11 @@ mod test {
                     ..empty_usb_endpoint_descriptor()
                 },
                 report_descriptor,
-            },
-            report_callback: ReportCallbackState::default(),
-            timer_services: noop_timer_services(),
-            recovery_event: None,
-        })
+            };
+            device.report_callback = ReportCallbackState::default();
+            device.timer_services = noop_timer_services();
+        });
+        device
     }
 
     unsafe extern "efiapi" fn test_callback(
@@ -365,6 +366,54 @@ mod test {
     // ---- get_report_descriptor tests ----
 
     #[test]
+    fn hid_operations_reject_reentrant_state_access() {
+        let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
+        let device = make_device(&mock_usb, vec![0x05]);
+        let hid_io = device.hid_io;
+        device.with(|_| {
+            let mut size = 8;
+            let mut buffer = [0u8; 8];
+            // SAFETY: the installed interface and all buffers are live; state is deliberately already borrowed.
+            unsafe {
+                assert_eq!(
+                    hid_get_report_descriptor(hid_io, &mut size, buffer.as_mut_ptr().cast()),
+                    efi::Status::ACCESS_DENIED,
+                );
+                assert_eq!(
+                    hid_get_report(hid_io, 0, HidReportType::InputReport, 8, buffer.as_mut_ptr().cast()),
+                    efi::Status::ACCESS_DENIED,
+                );
+                assert_eq!(
+                    hid_set_report(hid_io, 0, HidReportType::OutputReport, 8, buffer.as_mut_ptr().cast()),
+                    efi::Status::ACCESS_DENIED,
+                );
+                assert_eq!(
+                    hid_register_report_callback(hid_io, Some(test_callback), core::ptr::null_mut()),
+                    efi::Status::ACCESS_DENIED,
+                );
+                assert_eq!(hid_unregister_report_callback(hid_io, Some(test_callback)), efi::Status::ACCESS_DENIED);
+            }
+        });
+        assert_eq!(mock_usb.control_call_count.get(), 0);
+    }
+
+    #[test]
+    fn hid_operation_rejects_stopped_state() {
+        let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
+        let device = make_device(&mock_usb, vec![0x05]);
+        let interface = HidIoInterface {
+            hid_io: new_hid_io_protocol(),
+            state: device.with(|device| device.interface.as_ref().unwrap().interface().state),
+        };
+        drop(device);
+        let mut size = 8;
+        let mut buffer = [0u8; 8];
+        // SAFETY: this separate interface stays live even though its controller has stopped.
+        let status = unsafe { hid_get_report_descriptor(&interface.hid_io, &mut size, buffer.as_mut_ptr().cast()) };
+        assert_eq!(status, efi::Status::NOT_STARTED);
+    }
+
+    #[test]
     fn get_report_descriptor_null_this_returns_invalid_parameter() {
         let mut size = 64usize;
         let mut buffer = [0u8; 64];
@@ -378,26 +427,26 @@ mod test {
     fn get_report_descriptor_null_size_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05, 0x01]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 64];
-        // SAFETY: device is a valid UsbHidDevice; testing null size handling.
+        // SAFETY: device owns a live HidIoInterface; testing null size handling.
         let status =
             unsafe { hid_get_report_descriptor(hid_io_ptr, core::ptr::null_mut(), buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_descriptor_empty_descriptor_returns_not_found() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut size = 64usize;
         let mut buffer = [0u8; 64];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_get_report_descriptor(hid_io_ptr, &mut size, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::NOT_FOUND);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
@@ -405,14 +454,14 @@ mod test {
         let descriptor = vec![0x05, 0x01, 0x09, 0x06, 0xA1, 0x01];
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, descriptor.clone());
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut size = 2usize; // smaller than descriptor
         let mut buffer = [0u8; 2];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_get_report_descriptor(hid_io_ptr, &mut size, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::BUFFER_TOO_SMALL);
         assert_eq!(size, descriptor.len());
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
@@ -420,12 +469,12 @@ mod test {
         let descriptor = vec![0x05, 0x01];
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, descriptor);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut size = 64usize;
-        // SAFETY: device is a valid UsbHidDevice; testing null buffer handling.
+        // SAFETY: device owns a live HidIoInterface; testing null buffer handling.
         let status = unsafe { hid_get_report_descriptor(hid_io_ptr, &mut size, core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
@@ -433,15 +482,15 @@ mod test {
         let descriptor = vec![0x05, 0x01, 0x09, 0x06];
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, descriptor.clone());
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut size = 64usize;
         let mut buffer = [0u8; 64];
-        // SAFETY: device is a valid UsbHidDevice; buffer is large enough.
+        // SAFETY: device owns a live HidIoInterface; buffer is large enough.
         let status = unsafe { hid_get_report_descriptor(hid_io_ptr, &mut size, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(size, descriptor.len(), "size should be updated to actual descriptor length on success");
         assert_eq!(&buffer[..descriptor.len()], &descriptor);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
@@ -449,14 +498,14 @@ mod test {
         let descriptor = vec![0xAA, 0xBB, 0xCC];
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, descriptor.clone());
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut size = descriptor.len();
         let mut buffer = vec![0u8; descriptor.len()];
-        // SAFETY: device is a valid UsbHidDevice; buffer is exact size.
+        // SAFETY: device owns a live HidIoInterface; buffer is exact size.
         let status = unsafe { hid_get_report_descriptor(hid_io_ptr, &mut size, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(buffer, descriptor);
-        core::mem::forget(device);
+        drop(device);
     }
 
     // ---- get_report tests ----
@@ -475,33 +524,33 @@ mod test {
     fn get_report_null_buffer_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice; testing null buffer.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface; testing null buffer.
         let status = unsafe { hid_get_report(hid_io_ptr, 0, HidReportType::InputReport, 8, core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_zero_size_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing zero size.
+        // SAFETY: device owns a live HidIoInterface; testing zero size.
         let status =
             unsafe { hid_get_report(hid_io_ptr, 0, HidReportType::InputReport, 0, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_size_exceeds_u16_max_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing oversized request.
+        // SAFETY: device owns a live HidIoInterface; testing oversized request.
         let status = unsafe {
             hid_get_report(
                 hid_io_ptr,
@@ -512,62 +561,62 @@ mod test {
             )
         };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_output_type_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing invalid report type.
+        // SAFETY: device owns a live HidIoInterface; testing invalid report type.
         let status = unsafe {
             hid_get_report(hid_io_ptr, 0, HidReportType::OutputReport, 8, buffer.as_mut_ptr() as *mut c_void)
         };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_input_type_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_get_report(hid_io_ptr, 1, HidReportType::InputReport, 8, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(mock_usb.control_call_count.get(), 1);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_feature_type_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_get_report(hid_io_ptr, 1, HidReportType::Feature, 8, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(mock_usb.control_call_count.get(), 1);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn get_report_usb_error_is_propagated() {
         let mock_usb = make_mock_usb_io(efi::Status::DEVICE_ERROR, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let mut buffer = [0u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_get_report(hid_io_ptr, 0, HidReportType::InputReport, 8, buffer.as_mut_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
-        core::mem::forget(device);
+        drop(device);
     }
 
     // ---- set_report tests ----
@@ -586,33 +635,33 @@ mod test {
     fn set_report_null_buffer_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice; testing null buffer.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface; testing null buffer.
         let status = unsafe { hid_set_report(hid_io_ptr, 0, HidReportType::OutputReport, 8, core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_zero_size_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing zero size.
+        // SAFETY: device owns a live HidIoInterface; testing zero size.
         let status =
             unsafe { hid_set_report(hid_io_ptr, 0, HidReportType::OutputReport, 0, buffer.as_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_size_exceeds_u16_max_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing oversized request.
+        // SAFETY: device owns a live HidIoInterface; testing oversized request.
         let status = unsafe {
             hid_set_report(
                 hid_io_ptr,
@@ -623,61 +672,61 @@ mod test {
             )
         };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_input_type_returns_invalid_parameter() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice; testing invalid report type.
+        // SAFETY: device owns a live HidIoInterface; testing invalid report type.
         let status =
             unsafe { hid_set_report(hid_io_ptr, 0, HidReportType::InputReport, 8, buffer.as_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::INVALID_PARAMETER);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_output_type_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_set_report(hid_io_ptr, 1, HidReportType::OutputReport, 8, buffer.as_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(mock_usb.control_call_count.get(), 1);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_feature_type_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_set_report(hid_io_ptr, 1, HidReportType::Feature, 8, buffer.as_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::SUCCESS);
         assert_eq!(mock_usb.control_call_count.get(), 1);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn set_report_usb_error_is_propagated() {
         let mock_usb = make_mock_usb_io(efi::Status::DEVICE_ERROR, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         let buffer = [0x01u8; 8];
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status =
             unsafe { hid_set_report(hid_io_ptr, 0, HidReportType::OutputReport, 8, buffer.as_ptr() as *mut c_void) };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
-        core::mem::forget(device);
+        drop(device);
     }
 
     // ---- register_report_callback tests ----
@@ -694,40 +743,40 @@ mod test {
     fn register_callback_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
-        assert!(device.report_callback.callback.is_some());
-        core::mem::forget(device);
+        assert!(device.with(|device| device.report_callback.callback.is_some()));
+        drop(device);
     }
 
     #[test]
     fn register_callback_already_started() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         // Register first callback.
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
         // Second registration should fail.
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::ALREADY_STARTED);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn register_callback_clears_callback_on_transfer_failure() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::DEVICE_ERROR);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::DEVICE_ERROR);
-        assert!(device.report_callback.callback.is_none());
-        core::mem::forget(device);
+        assert!(device.with(|device| device.report_callback.callback.is_none()));
+        drop(device);
     }
 
     // ---- unregister_report_callback tests ----
@@ -743,41 +792,41 @@ mod test {
     fn unregister_callback_not_started() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice; no callback registered.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface; no callback registered.
         let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(test_callback)) };
         assert_eq!(status, efi::Status::NOT_STARTED);
-        core::mem::forget(device);
+        drop(device);
     }
 
     #[test]
     fn unregister_callback_wrong_callback_returns_not_started() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
+        let hid_io_ptr = device.hid_io;
         // Register one callback, then try to unregister a different one.
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(other_callback)) };
         assert_eq!(status, efi::Status::NOT_STARTED);
-        assert!(device.report_callback.callback.is_some());
-        core::mem::forget(device);
+        assert!(device.with(|device| device.report_callback.callback.is_some()));
+        drop(device);
     }
 
     #[test]
     fn unregister_callback_succeeds() {
         let mock_usb = make_mock_usb_io(efi::Status::SUCCESS, efi::Status::SUCCESS);
         let device = make_device(&mock_usb, vec![0x05]);
-        let hid_io_ptr = &device.hid_io as *const HidIoProtocol;
-        // SAFETY: device is a valid UsbHidDevice.
+        let hid_io_ptr = device.hid_io;
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_register_report_callback(hid_io_ptr, Some(test_callback), core::ptr::null_mut()) };
         assert_eq!(status, efi::Status::SUCCESS);
-        // SAFETY: device is a valid UsbHidDevice.
+        // SAFETY: device owns a live HidIoInterface.
         let status = unsafe { hid_unregister_report_callback(hid_io_ptr, Some(test_callback)) };
         assert_eq!(status, efi::Status::SUCCESS);
-        assert!(device.report_callback.callback.is_none());
-        core::mem::forget(device);
+        assert!(device.with(|device| device.report_callback.callback.is_none()));
+        drop(device);
     }
 }

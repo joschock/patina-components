@@ -13,8 +13,17 @@ other HID input support.
 
 ## Architecture
 
-The component installs a UEFI Driver Binding that manages USB HID device instances. The driver follows the standard
-UEFI Driver Model:
+The component implements Patina's `ControllerDriver` abstraction, which installs a UEFI Driver Binding and manages
+USB IO protocol ownership and per-controller state. The HidIo interface is installed with Patina's owned protocol
+API and reclaimed after successful uninstallation; controller state retains the installation token for teardown
+and retries. The allocation provides the stable address required by UEFI and USB callbacks; those entry points
+use Patina's checked controller state access rather than raw device
+pointers. Reentrant state access returns `EFI_ACCESS_DENIED`; access before startup completes or during teardown
+returns `EFI_NOT_STARTED`. Consumer report callbacks run after releasing the state borrow so they can call HidIo.
+USB IO is supplied by Patina's checked protocol access for report operations and callbacks, and by `StopContext`
+during teardown. The device state does not cache a USB IO pointer.
+
+The driver follows the standard UEFI Driver Model:
 
 1. **Supported** — checks if a controller has USB IO with HID interface class.
 2. **Start** — reads USB descriptors, configures report protocol mode for boot devices, and installs the HidIo
@@ -31,7 +40,7 @@ handles USB transfer errors.
 | `control_transfers` | USB control transfer helpers for HID devices (set protocol, set/get report). |
 | `descriptors` | USB descriptor reading for HID devices (HID descriptor, report descriptor). |
 | `device` | Per-device state for USB HID devices. |
-| `driver` | Driver binding implementation that manages USB HID device instances on controllers. |
+| `driver` | Controller driver implementation that manages USB HID device instances on controllers. |
 | `hid_io_impl` | HidIoProtocol function pointer implementations — delegates to USB IO operations. |
 | `interrupt_transfers` | Async interrupt transfer management and error recovery. |
 

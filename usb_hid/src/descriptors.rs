@@ -32,6 +32,9 @@ impl HidDescriptor {
         let count = self.header().num_descriptors as usize;
         let available =
             self.data.len().saturating_sub(size_of::<EfiUsbHidDescriptor>()) / size_of::<HidClassDescriptor>();
+        if available < count {
+            log::warn!("USB HID: HID descriptor declares {count} class descriptors, but only {available} fit");
+        }
         let count = count.min(available);
         // SAFETY: Construction validates data.len() >= header + at least `count` class descriptors.
         unsafe {

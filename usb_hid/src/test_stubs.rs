@@ -12,6 +12,55 @@ use core::ffi::c_void;
 
 use r_efi::{efi, efi::protocols::usb_io};
 
+use crate::{
+    device::UsbHidDevice,
+    driver::test::{InstalledDriver, managed_device_with_lookup},
+};
+use patina::{component::service::uefi_services::handle::Handle, vendor_protocols::hid_io::HidIoProtocol};
+
+/// Real ControllerDriver state with a borrowed USB mock for protocol and callback tests.
+pub(crate) struct TestDevice<'a> {
+    driver: InstalledDriver,
+    pub hid_io: *const HidIoProtocol,
+    _usb: core::marker::PhantomData<&'a usb_io::Protocol>,
+}
+
+impl<'a> TestDevice<'a> {
+    pub fn new(usb: &'a usb_io::Protocol) -> Self {
+        let driver = managed_device_with_lookup(Some(usb as *const _ as usize));
+        let hid_io = driver
+            .managed
+            .with_state(controller(), |device| {
+                device.recovery_event = None;
+                &raw const device.interface.as_ref().unwrap().interface().hid_io
+            })
+            .unwrap();
+        Self { driver, hid_io, _usb: core::marker::PhantomData }
+    }
+
+    pub fn with<R>(&self, operation: impl FnOnce(&mut UsbHidDevice) -> R) -> R {
+        self.driver.managed.with_state(controller(), operation).unwrap()
+    }
+
+    pub fn with_protocol<R>(&self, operation: impl FnOnce(&mut UsbHidDevice, &usb_io::Protocol) -> R) -> R {
+        self.driver.managed.with_controller(controller(), |device, protocol| operation(device, &protocol.0)).unwrap()
+    }
+
+    pub fn context(&self) -> *mut c_void {
+        self.hid_io as *mut c_void
+    }
+}
+
+fn controller() -> Handle {
+    Handle::from_raw(0x2 as efi::Handle).unwrap()
+}
+
+impl Drop for TestDevice<'_> {
+    fn drop(&mut self) {
+        assert_eq!(self.driver.stop(), efi::Status::SUCCESS);
+    }
+}
+
 /// Creates a stub USB IO protocol with panicking function pointers.
 ///
 /// Callers should replace the function pointers they need before use.
