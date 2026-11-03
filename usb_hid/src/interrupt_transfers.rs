@@ -130,7 +130,7 @@ unsafe extern "efiapi" fn on_report_interrupt_complete(
     if let Some(callback) = callback
         && let Some(notify) = callback.callback
     {
-        // Release the state borrow before calling consumers, which may reenter HidIo or stop the controller.
+        // The state borrow has ended, so consumers may reenter HidIo or stop the controller.
         // SAFETY: data is valid for data_length bytes and the callback context is registered by the consumer.
         unsafe { notify(data_length as u16, data, callback.context) };
     }

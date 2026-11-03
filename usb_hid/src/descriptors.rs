@@ -59,14 +59,11 @@ pub fn read_descriptors(usb_io_protocol: &usb_io::Protocol) -> Result<UsbHidDesc
         return Err(status);
     }
 
-    let interface_class = interface_descriptor.interface_class;
-    let interface_sub_class = interface_descriptor.interface_sub_class;
-    let interface_protocol = interface_descriptor.interface_protocol;
     log::trace!(
         "USB HID: interface class: 0x{:x}, subclass: 0x{:x}, protocol: 0x{:x}",
-        interface_class,
-        interface_sub_class,
-        interface_protocol,
+        interface_descriptor.interface_class,
+        interface_descriptor.interface_sub_class,
+        interface_descriptor.interface_protocol,
     );
 
     let mut int_in_endpoint_descriptor = empty_usb_endpoint_descriptor();
