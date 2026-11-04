@@ -13,16 +13,25 @@ produces standard UEFI input protocols for keyboard and pointer HID devices:
 
 ## Architecture
 
-The component installs a UEFI Driver Binding that manages HID device instances. When the driver is
+The component uses Patina's `ControllerDriver` to install a UEFI Driver Binding and manage HidIo protocol ownership
+and per-controller device state. No private instance protocol or manual HidIo open/close bookkeeping is needed.
+When the driver is
 started on a controller that exposes the HidIo protocol, it:
 
-1. Opens the HidIo protocol on the controller.
+1. Receives the HidIo protocol opened `BY_DRIVER` by Patina.
 2. Parses the HID report descriptor to identify keyboard and pointer usages.
 3. Creates the appropriate input protocol handlers (keyboard and/or pointer).
 4. Installs the corresponding UEFI input protocols on the controller handle:
    - **SimpleTextInput** and **SimpleTextInputEx** for keyboard devices.
    - **AbsolutePointer** for pointer and touch devices.
 5. Registers a report callback to receive asynchronous HID input reports.
+
+On stop, report callbacks are unregistered and the report-processing event is closed, dropping the keyboard and
+pointer receivers before Patina releases HidIo. Unregistration or event-close failures refuse stop and preserve
+state for retry. Report dispatch holds a checked controller-state borrow, so Patina refuses stop while receivers
+are processing input.
+Receiver-level protocol cleanup retains the existing behavior: failed input-protocol uninstalls retain their
+handlers rather than freeing memory still referenced by firmware.
 
 ### Report Processing
 
@@ -37,7 +46,7 @@ regardless of the producer's calling TPL:
 
 | Module | Description |
 |---|---|
-| `hid` | Driver binding implementation that manages HID instances on controllers. |
+| `hid` | Controller driver implementation that manages HID instances on controllers. |
 | `hid_io` | HidIo protocol FFI bindings, report queue, and receiver traits (`HidIo`, `HidReportReceiver`). |
 | `keyboard` | Keyboard HID handler — translates HID key reports into UEFI keystrokes using HII keyboard layouts, and produces SimpleTextInput / SimpleTextInputEx protocol interfaces. |
 | `pointer` | Pointer HID handler — translates HID pointer/touch reports into absolute pointer state and produces the AbsolutePointer protocol interface. |

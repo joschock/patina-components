@@ -31,10 +31,8 @@ use patina::{
         service::{
             Service,
             uefi_services::{
-                event::EventServices,
-                protocol::{ProtocolServices, ProtocolServicesExt},
-                timer_event::TimerEventServices,
-                tpl::TplServices,
+                controller_driver::install_controller_driver, event::EventServices, protocol::ProtocolServices,
+                timer_event::TimerEventServices, tpl::TplServices,
             },
         },
     },
@@ -83,7 +81,8 @@ impl UefiHidComponent {
         runtime_services: StandardRuntimeServices,
     ) -> Result<()> {
         RUNTIME_SERVICES.store(runtime_services.as_mut_ptr(), core::sync::atomic::Ordering::SeqCst);
-        install_hid_driver_binding(HidServices { protocols, events, timers, tpl })
+        install_controller_driver(protocols, hid::HidDriver::new(HidServices { protocols, events, timers, tpl }))?;
+        Ok(())
     }
 
     #[cfg(not(feature = "ctrl-alt-del"))]
@@ -94,24 +93,14 @@ impl UefiHidComponent {
         timers: Service<dyn TimerEventServices>,
         tpl: Service<dyn TplServices>,
     ) -> Result<()> {
-        install_hid_driver_binding(HidServices { protocols, events, timers, tpl })
+        install_controller_driver(protocols, hid::HidDriver::new(HidServices { protocols, events, timers, tpl }))?;
+        Ok(())
     }
-}
-
-/// Installs the HID driver binding using the provided services.
-///
-/// Separated from the component entry point to allow testing with mock services.
-fn install_hid_driver_binding(services: HidServices) -> Result<()> {
-    services.protocols.install_driver_binding(hid::HidDriver::new(services))?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod test {
-    use patina::{
-        component::service::uefi_services::{handle::Handle, protocol::ProtocolError},
-        error::EfiError,
-    };
+    use patina::component::service::uefi_services::{handle::Handle, protocol::ProtocolError};
 
     use super::*;
 
@@ -127,7 +116,7 @@ mod test {
                 Ok(handle.unwrap())
             });
         });
-        install_hid_driver_binding(services).expect("install should succeed");
+        install_controller_driver(services.protocols, hid::HidDriver::new(services)).expect("install should succeed");
     }
 
     #[test]
@@ -135,13 +124,19 @@ mod test {
         let services = test_stubs::mock_services(|protocols, _, _| {
             protocols.expect_register_agent().returning(|| Err(ProtocolError::OutOfResources));
         });
-        assert_eq!(install_hid_driver_binding(services), Err(EfiError::OutOfResources));
+        assert!(matches!(
+            install_controller_driver(services.protocols, hid::HidDriver::new(services)),
+            Err(ProtocolError::OutOfResources)
+        ));
 
         let services = test_stubs::mock_services(|protocols, _, _| {
             protocols.expect_register_agent().returning(|| Ok(Handle::from_raw(0x5678 as efi::Handle).unwrap()));
             protocols.expect_image_handle().times(1).returning(|| Handle::from_raw(0x1234 as efi::Handle).unwrap());
             protocols.expect_install_interface().returning(|_, _, _| Err(ProtocolError::OutOfResources));
         });
-        assert_eq!(install_hid_driver_binding(services), Err(EfiError::OutOfResources));
+        assert!(matches!(
+            install_controller_driver(services.protocols, hid::HidDriver::new(services)),
+            Err(ProtocolError::OutOfResources)
+        ));
     }
 }
